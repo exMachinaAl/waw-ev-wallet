@@ -1,0 +1,32 @@
+{
+  "reference": "C:\\Program Files X\\WORLD-Arcade-Engine-Main",
+  "tracked_files": [
+    "integrations/wa-world/adapter.mjs",
+    "package.json",
+    "src/admin.mjs",
+    "src/blackjack-tables.mjs",
+    "src/db.mjs",
+    "src/games.mjs",
+    "src/lottery.mjs",
+    "src/number-draw.mjs",
+    "src/rooms.mjs",
+    "src/roulette-rounds.mjs",
+    "src/server.mjs",
+    "src/stake-policy.mjs",
+    "web/src/App.jsx"
+  ],
+  "new_files": [
+    "scripts/dev-val.mjs",
+    "scripts/migrate-val.mjs",
+    "tests/val.test.mjs",
+    "tests/fixtures/val-spend-worker.mjs",
+    "web/src/components/ValWallet.jsx",
+    "web/src/components/val-wallet.css",
+    "src/val/api.mjs",
+    "src/val/commands.mjs",
+    "src/val/ledger.mjs",
+    "src/val/play-safety.mjs",
+    "src/val/schema.mjs"
+  ],
+  "status": "Archived after user correction; not the standalone wallet application"
+}

@@ -1,0 +1,41 @@
+{
+  "name": "waw-ev-wallet",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "EV-wallet VAL \u00e2\u20ac\u201d dompet kredit virtual mandiri untuk WAW",
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "start": "node --experimental-sqlite src/platform/server.mjs",
+    "dev": "node --experimental-sqlite src/platform/server.mjs",
+    "dev:web": "vite --open /lab",
+    "server:arcade": "node --experimental-sqlite src/server.mjs",
+    "build": "vite build",
+    "check": "node scripts/check.mjs",
+    "test": "node --experimental-sqlite --test tests/core.test.mjs tests/http.test.mjs tests/platform.test.mjs tests/mobile-adapters.test.mjs",
+    "test:integration": "node --experimental-sqlite --test tests/arcade.test.mjs",
+    "test:arcade-regression": "node --experimental-sqlite --test .local/arcade/tests/*.test.mjs",
+    "test:browser": "node --experimental-sqlite scripts/browser-test.mjs",
+    "arcade:prepare": "node integrations/arcade/prepare.mjs",
+    "demo:arcade": "node --experimental-sqlite scripts/demo-arcade.mjs",
+    "migrate:val": "node --experimental-sqlite scripts/migrate-val.mjs",
+    "server:init": "node --experimental-sqlite scripts/init-platform.mjs",
+    "server:lab": "node --experimental-sqlite src/platform/server.mjs",
+    "test:platform": "node --experimental-sqlite --test tests/platform.test.mjs tests/mobile-adapters.test.mjs",
+    "test:lab:browser": "node --experimental-sqlite scripts/lab-browser-test.mjs",
+    "api:docs": "node --experimental-sqlite scripts/platform-docs.mjs"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.1.0",
+    "playwright": "^1.56.0",
+    "vite": "^7.1.12"
+  }
+}

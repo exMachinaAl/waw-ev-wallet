@@ -1,0 +1,24 @@
+{
+  "name": "world-arcade-engine",
+  "version": "1.0.0-rc.3",
+  "private": true,
+  "type": "module",
+  "description": "Standalone virtual-credit arcade with WhatsApp/Web session handoff",
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "start": "node scripts/require-web-build.mjs && node --experimental-sqlite src/server.mjs",
+    "test": "node --experimental-sqlite --test tests/*.test.mjs",
+    "check": "node --experimental-sqlite scripts/check.mjs && node scripts/check-web.mjs",
+    "build:web": "node scripts/build-web.mjs",
+    "dev:web": "npm --prefix web run dev",
+    "test:web:source": "node scripts/check-web.mjs",
+    "migrate": "node --experimental-sqlite scripts/migrate.mjs",
+    "test:browser": "node scripts/browser-test.mjs",
+    "migrate:rc2": "node --experimental-sqlite scripts/migrate-rc2.mjs",
+    "dev:val": "node --experimental-sqlite scripts/dev-val.mjs",
+    "migrate:val": "node --experimental-sqlite scripts/migrate-val.mjs",
+    "test:val": "node --experimental-sqlite --test tests/val*.test.mjs"
+  }
+}

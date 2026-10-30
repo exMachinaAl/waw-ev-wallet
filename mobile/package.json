@@ -1,0 +1,9 @@
+{
+ "name":"@waw/val-client",
+ "version":"0.2.0",
+ "private":true,
+ "type":"module",
+ "main":"./src/client.js",
+ "types":"./src/index.d.ts",
+ "exports":{".":{"types":"./src/index.d.ts","default":"./src/client.js"},"./adapters":{"types":"./src/adapters.d.ts","default":"./src/adapters.js"}}
+}

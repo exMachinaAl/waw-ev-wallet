@@ -1,0 +1,843 @@
+diff --git a/integrations/wa-world/adapter.mjs b/integrations/wa-world/adapter.mjs
+index 792386c..369a2f3 100644
+--- a/integrations/wa-world/adapter.mjs
++++ b/integrations/wa-world/adapter.mjs
+@@ -133,7 +133,7 @@ export function createWorldArcadeAdapter({apiUrl='http://127.0.0.1:8787',service
+     }
+     if(['slot','scatter','guci','blast','fusion','roulette','blackjack'].includes(op)){
+       const bet=Number(args[2]||10);const codes={slot:'A1-01',scatter:'A1-02',guci:'A1-03',blast:'A1-04',fusion:'A1-05',roulette:'B1',blackjack:'B2'};
+-      const r=await post('/internal/v1/games/create',{subject,game_code:codes[op],bet});return summarize(r);
++      const r=await post('/internal/v1/games/create',{subject,game_code:codes[op],bet,command_id:`wa:create:${messageId||randomUUID()}`});return summarize(r);
+     }
+     if(op==='open'){
+       const fusion=(args[2]||'').toLowerCase()==='fusion';
+diff --git a/package.json b/package.json
+index e939a56..f29826a 100644
+--- a/package.json
++++ b/package.json
+@@ -16,6 +16,9 @@
+     "test:web:source": "node scripts/check-web.mjs",
+     "migrate": "node --experimental-sqlite scripts/migrate.mjs",
+     "test:browser": "node scripts/browser-test.mjs",
+-    "migrate:rc2": "node --experimental-sqlite scripts/migrate-rc2.mjs"
++    "migrate:rc2": "node --experimental-sqlite scripts/migrate-rc2.mjs",
++    "dev:val": "node --experimental-sqlite scripts/dev-val.mjs",
++    "migrate:val": "node --experimental-sqlite scripts/migrate-val.mjs",
++    "test:val": "node --experimental-sqlite --test tests/val*.test.mjs"
+   }
+ }
+diff --git a/src/admin.mjs b/src/admin.mjs
+index ab6606d..e2d96b0 100644
+--- a/src/admin.mjs
++++ b/src/admin.mjs
+@@ -1,7 +1,8 @@
++import {postTransfer as transfer} from './val/ledger.mjs';
+ /** Admin-only ACR test credits. Does not import, call, or touch WA-WORLD's VCUR. */
+ import {randomBytes,scryptSync,timingSafeEqual,createHash} from 'node:crypto';
+ import {uuid,now,assert} from './util.mjs';
+-import {transaction,transfer,accountId,audit,wallet} from './db.mjs';
++import {transaction,accountId,audit,wallet} from './db.mjs';
+ 
+ const SALT_LEN=16,KEY_LEN=64,SESSION_MS=12*60*60*1000;
+ const POOL_ID='wae-admin-test-pool';
+@@ -102,7 +103,7 @@ export function adminAdjust(db,admin,{player_id,operation,amount,reason,request_
+      assert(used+amount<=DAILY_GRANT_LIMIT,409,'DAILY_ADMIN_LIMIT');
+    }
+    const userAccount=accountId(db,player_id);
+-   const result=transfer(db,{from:operation==='ADD'?POOL_ID:userAccount,to:operation==='ADD'?userAccount:POOL_ID,
++   const result=transfer(db,{kind:'CORRECTION',from:operation==='ADD'?POOL_ID:userAccount,to:operation==='ADD'?userAccount:POOL_ID,
+      amount,eventKey:`admin:${request_id}`,reason:`ADMIN_TEST_${operation}: ${reason.trim()}`});
+    assert(!result.reused,409,'DUPLICATE_ADMIN_LEDGER');
+    const id=uuid();
+diff --git a/src/blackjack-tables.mjs b/src/blackjack-tables.mjs
+index 6c00a9a..3dab044 100644
+--- a/src/blackjack-tables.mjs
++++ b/src/blackjack-tables.mjs
+@@ -1,10 +1,12 @@
++import {bindCommand} from './val/commands.mjs';
++import {postTransfer as transfer} from './val/ledger.mjs';
+ import {policy,checkStake,reserve,releaseReserve,tenantFor} from './stake-policy.mjs';
+ /** WAE v0.12: persistent 2-4 player blackjack tables, shared dealer and deck.
+  * ACR only. All card draws and settlement occur on the server within one SQLite transaction.
+  */
+ import {randomInt} from 'node:crypto';
+ import {uuid,now,json,parse,assert,fail} from './util.mjs';
+-import {transaction,accountId,transfer,wallet} from './db.mjs';
++import {transaction,accountId,wallet} from './db.mjs';
+ 
+ const LETTERS='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+ const OPEN_MS=2*60*60*1000;
+@@ -66,6 +68,7 @@ function stamp(db,t,state,status=t.status){
+ export function createBlackjackTable(db,p,{bet=10,command_id}={}){
+  idCheck(command_id);tenantFor(db,p);checkStake(bet,policy(db,'B2-MP'));
+  return transaction(db,()=>{
++  bindCommand(db,p,command_id,{operation:'blackjack.create',bet});
+   const prior=db.prepare('SELECT table_id,response_json FROM bj_commands WHERE tenant_id=? AND player_id=? AND command_id=?').get('wa-world',p,command_id);
+   if(prior)return parse(prior.response_json);
+   assert(db.prepare("SELECT COUNT(*) n FROM bj_tables WHERE host_id=? AND status='OPEN' AND expires_ms>?").get(p,now()).n<3,429,'TABLE_LIMIT');
+@@ -83,6 +86,7 @@ export const blackjackMyTables=(db,p)=>db.prepare('SELECT t.* FROM bj_tables t J
+ export function joinBlackjackTable(db,p,ref,{expected_version,command_id}={}){
+  idCheck(command_id);
+  return transaction(db,()=>{
++  bindCommand(db,p,command_id,{operation:'blackjack.join',ref,expected_version});
+   const t=table(db,ref,p,false),prior=stored(db,p,command_id,t.id);if(prior)return prior;
+   open(t);version(t,expected_version);
+   const m=members(db,t.id);assert(!m.some(x=>x.player_id===p),409,'ALREADY_JOINED');assert(m.length<4,409,'TABLE_FULL');
+@@ -130,6 +134,7 @@ function start(db,t,m){
+ export function blackjackTableAction(db,p,ref,{action,expected_version,command_id,confirm_forfeit=false}={}){
+  idCheck(command_id);
+  return transaction(db,()=>{
++  bindCommand(db,p,command_id,{operation:'blackjack.action',ref,action,expected_version,confirm_forfeit});
+   const t=table(db,ref,p,false),prior=stored(db,p,command_id,t.id);if(prior)return prior;
+   // Only actual members can mutate or perform timeout processing.
+   const m=members(db,t.id),mine=m.find(x=>x.player_id===p);assert(mine,403,'TABLE_ACCESS_DENIED');
+diff --git a/src/db.mjs b/src/db.mjs
+index 101ab49..01f3af1 100644
+--- a/src/db.mjs
++++ b/src/db.mjs
+@@ -1,3 +1,5 @@
++import {postTransfer} from './val/ledger.mjs';
++import {registerValWriter,hasValSchema,migrateVal} from './val/schema.mjs';
+ import {setupRcSchema} from './rc-schema.mjs';
+ import {DatabaseSync} from 'node:sqlite';
+ import fs from 'node:fs';
+@@ -6,6 +8,8 @@ import {uuid,now,json,fail,assert} from './util.mjs';
+ export function openDb(filename=':memory:'){
+  if(filename!==':memory:')fs.mkdirSync(path.dirname(filename),{recursive:true});
+  const db=new DatabaseSync(filename);
++ registerValWriter(db);
++ if(db.prepare("SELECT 1 FROM sqlite_master WHERE name='accounts'").get()&&!hasValSchema(db)){db.close();fail(409,'VAL_MIGRATION_REQUIRED');}
+  db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL;
+  CREATE TABLE IF NOT EXISTS tenants(id TEXT PRIMARY KEY,slug TEXT UNIQUE NOT NULL);
+  CREATE TABLE IF NOT EXISTS players(id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL REFERENCES tenants(id),created_ms INTEGER NOT NULL);
+@@ -27,29 +31,15 @@ export function openDb(filename=':memory:'){
+  db.prepare('INSERT OR IGNORE INTO accounts(id,tenant_id,owner_id,kind,balance) VALUES(?,?,?,?,?)').run('wa-faucet','wa-world',null,'FAUCET',2000000);
+  db.prepare('INSERT OR IGNORE INTO accounts(id,tenant_id,owner_id,kind,balance) VALUES(?,?,?,?,?)').run('wa-treasury','wa-world',null,'TREASURY',800000);
+  setupRcSchema(db);
++ migrateVal(db);
+  return db;
+ }
+ export function transaction(db,fn){db.exec('BEGIN IMMEDIATE');try{const out=fn();db.exec('COMMIT');return out;}catch(e){db.exec('ROLLBACK');throw e;}}
+ export function audit(db,event,detail={},tenant='wa-world'){db.prepare('INSERT INTO audit VALUES(?,?,?,?,?)').run(uuid(),tenant,event,json(detail),now());}
+ function acct(db,tenant,owner,kind){return db.prepare('SELECT * FROM accounts WHERE tenant_id=? AND kind=? AND owner_id IS ?').get(tenant,kind,owner);}
+ export function wallet(db,playerId,tenant='wa-world'){return acct(db,tenant,playerId,'PLAYER')?.balance??0;}
+-export function transfer(db,{tenant='wa-world',from,to,amount,eventKey,reason}){
+- assert(Number.isSafeInteger(amount)&&amount>0&&amount<=1000000000000,400,'INVALID_AMOUNT');
+- // Caller wraps in transaction; enforce no unauthorized currency or cross-tenant writes.
+- const existing=db.prepare('SELECT id FROM transfers WHERE tenant_id=? AND event_key=?').get(tenant,eventKey);
+- if(existing)return {reused:true};
+- const src=db.prepare('SELECT * FROM accounts WHERE id=? AND tenant_id=?').get(from,tenant);
+- const dst=db.prepare('SELECT * FROM accounts WHERE id=? AND tenant_id=?').get(to,tenant);
+- assert(src&&dst,400,'INVALID_ACCOUNTS');assert(src.balance>=amount,409,'INSUFFICIENT_ACR');assert(from!==to,400,'SAME_ACCOUNT');
+- assert(Number.isSafeInteger(dst.balance+amount),400,'BALANCE_OVERFLOW');
+- if(from==='wa-treasury'){const reserved=db.prepare('SELECT COALESCE(SUM(amount),0) n FROM treasury_reserves WHERE tenant_id=?').get(tenant).n;assert(src.balance-amount>=reserved,409,'TREASURY_RESERVED');}
+- const id=uuid();db.prepare('INSERT INTO transfers VALUES(?,?,?,?,?)').run(id,tenant,eventKey,reason,now());
+- db.prepare('UPDATE accounts SET balance=balance-? WHERE id=?').run(amount,from);
+- db.prepare('UPDATE accounts SET balance=balance+? WHERE id=?').run(amount,to);
+- db.prepare('INSERT INTO entries(transfer_id,account_id,delta) VALUES(?,?,?)').run(id,from,-amount);
+- db.prepare('INSERT INTO entries(transfer_id,account_id,delta) VALUES(?,?,?)').run(id,to,amount);
+- return {reused:false,transferId:id};
+-}
++// Compatibility adapter: every existing Arcade writer enters VAL in the caller transaction.
++export const transfer=postTransfer;
+ export function ensurePlayer(db,subject,provider='wa',tenant='wa-world'){
+  assert(typeof subject==='string'&&subject.length>=3&&subject.length<=120&&/^[a-zA-Z0-9_.:@+-]+$/.test(subject),400,'BAD_IDENTITY');
+  assert(['wa','demo'].includes(provider),400,'BAD_PROVIDER');
+diff --git a/src/games.mjs b/src/games.mjs
+index c15f4a1..b8e3041 100644
+--- a/src/games.mjs
++++ b/src/games.mjs
+@@ -1,10 +1,12 @@
+-import {policy,checkStake,reserve,releaseReserve,tenantFor} from './stake-policy.mjs';
++import {bindCommand} from './val/commands.mjs';
++import {postTransfer as transfer} from './val/ledger.mjs';
++import {policy,checkStake,reserve,releaseReserve,tenantFor,once} from './stake-policy.mjs';
+ import {normalizeSlip,roulettePayout,rouletteColor} from './roulette-rounds.mjs';
+ import {randomInt} from 'node:crypto';
+ import {runNumberDraw,drawQuota,DRAW_POLICY} from './number-draw.mjs';
+ import {evaluateBidirectionalLines} from './slot-rules.mjs';
+ import {uuid,now,json,parse,assert,fail} from './util.mjs';
+-import {transaction,wallet,transfer,accountId} from './db.mjs';
++import {transaction,wallet,accountId} from './db.mjs';
+ import {generateGrid,resolveScatterSpin} from './scatter-rush.mjs';
+ import {initialPotState,generatePotGrid,resolvePotSpin,resolvePotChoice,publicPotState} from './mystery-guci.mjs';
+ import {generateBlastGrid,resolveBlastSpin} from './column-blast.mjs';
+@@ -66,11 +68,11 @@ function settleBlackjack(db,pid,state,eventKey){
+  credit(db,pid,payout,eventKey);
+  state.phase='FINISHED';state.outcome=outcome;state.payout=payout;
+ }
+-export function createGame(db,playerId,gameCode,bet=10){
++export function createGame(db,playerId,gameCode,bet=10,commandId=null){
+  tenantFor(db,playerId);
+  assert(GAMES[gameCode],404,'UNKNOWN_GAME');assert(gameCode!=='T0',400,'USE_MULTIPLAYER_LOBBY');
+  if(gameCode==='L1')fail(410,'LOTTERY_USE_ROUNDS_API');else checkBet(bet,policy(db,gameCode));
+- return transaction(db,()=>{
++ const create=()=>{
+   const id=uuid(),state={phase:'READY',last:null,bet,stake_policy:policy(db,gameCode)};
+   if(gameCode==='L1')Object.assign(state,{phase:'READY',bet:0,quota:drawQuota(db,playerId),last:null});
+   if(gameCode==='A1-03')Object.assign(state,initialPotState(bet));
+@@ -81,7 +83,8 @@ export function createGame(db,playerId,gameCode,bet=10){
+   if(gameCode==='B2'&&state.phase==='FINISHED')releaseReserve(db,`solo:${id}`);
+   const session=getSession(db,id,playerId);
+   addEvent(db,playerId,session,'game.created');return {session,balance:wallet(db,playerId)};
+- });
++ };
++ return commandId?once(db,playerId,commandId,{operation:'game.create',gameCode,bet},create):transaction(db,create);
+ }
+ function addEvent(db,playerId,s,eventType){db.prepare('INSERT INTO outbox(tenant_id,player_id,session_id,event_type,version,payload_json,created_ms) VALUES(?,?,?,?,?,?,?)').run('wa-world',playerId,s.id,eventType,s.version,json({sessionId:s.id,version:s.version}),now());}
+ function perform(db,pid,record,command){
+@@ -174,6 +177,7 @@ export function act(db,playerId,sessionId,command){
+  assert(Number.isSafeInteger(command.expected_version),400,'VERSION_REQUIRED');
+  return transaction(db,()=>{
+   const row=playerSession(db,sessionId,playerId);
++  bindCommand(db,playerId,command.command_id,{operation:'game.action',sessionId,...command});
+   const previous=db.prepare('SELECT * FROM game_actions WHERE tenant_id=? AND command_id=?').get('wa-world',command.command_id);
+   if(previous){assert(previous.session_id===sessionId,409,'COMMAND_REUSED_FOR_OTHER_SESSION');return parse(previous.response_json);}
+   if(row.version!==command.expected_version)fail(409,'STATE_STALE');
+diff --git a/src/lottery.mjs b/src/lottery.mjs
+index ae3cf35..a149d81 100644
+--- a/src/lottery.mjs
++++ b/src/lottery.mjs
+@@ -1,6 +1,7 @@
++import {postTransfer as transfer} from './val/ledger.mjs';
+ import {randomBytes,createHmac} from 'node:crypto';
+ import {assert,uuid,now,json,parse,digest,fail} from './util.mjs';
+-import {transaction,transfer,accountId,wallet} from './db.mjs';
++import {transaction,accountId,wallet} from './db.mjs';
+ import {policy,checkStake,tenantFor,once,reserve,releaseReserve} from './stake-policy.mjs';
+ export const lotteryEnabled=()=>process.env.LOTTERY_ENABLED==='true';
+ const requireEnabled=()=>assert(lotteryEnabled(),403,'LOTTERY_DISABLED');
+diff --git a/src/number-draw.mjs b/src/number-draw.mjs
+index 7f39b49..d5b8b10 100644
+--- a/src/number-draw.mjs
++++ b/src/number-draw.mjs
+@@ -1,6 +1,7 @@
++import {postTransfer as transfer} from './val/ledger.mjs';
+ import {randomInt} from 'node:crypto';
+ import {assert,now,uuid} from './util.mjs';
+-import {transaction,accountId,transfer,wallet} from './db.mjs';
++import {transaction,accountId,wallet} from './db.mjs';
+ 
+ // Free-to-play test arcade number draw. No real-world value, purchases or VCUR conversion.
+ export const DRAW_POLICY=Object.freeze({minDigits:4,maxDigits:12,playerDailyEntries:3,globalDailyEntries:200,baseReward:10,extraMatchFactor:1.5,maxReward:500,dailyWorstCaseBudget:100000});
+diff --git a/src/rooms.mjs b/src/rooms.mjs
+index f750beb..f72c42c 100644
+--- a/src/rooms.mjs
++++ b/src/rooms.mjs
+@@ -1,10 +1,12 @@
++import {bindCommand} from './val/commands.mjs';
++import {postTransfer as transfer} from './val/ledger.mjs';
+ import {policy,checkStake,tenantFor} from './stake-policy.mjs';
+ /** WAE v0.9: transactional two-player rooms. Only Dice Duel (T0) is multiplayer.
+  * No VCUR reads/writes, no user-to-user transfers outside game settlement.
+  */
+ import {randomInt} from 'node:crypto';
+ import {uuid,now,json,parse,assert,fail} from './util.mjs';
+-import {transaction,accountId,transfer,wallet} from './db.mjs';
++import {transaction,accountId,wallet} from './db.mjs';
+ 
+ const ALPHABET='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+ const MAX_AGE=2*60*60*1000;
+@@ -63,6 +65,7 @@ function stamp(db,room,extra={}){
+ export function createRoom(db,playerId,{bet=10,command_id}={}){
+  commandId(command_id);tenantFor(db,playerId);checkStake(bet,policy(db,'T0'));
+  return transaction(db,()=>{
++  bindCommand(db,playerId,command_id,{operation:'room.create',bet});
+   const prior=db.prepare('SELECT room_id,response_json FROM multiplayer_commands WHERE tenant_id=? AND player_id=? AND command_id=?').get('wa-world',playerId,command_id);
+   if(prior)return parse(prior.response_json);
+   // Limit unattended rooms per player, avoiding unbounded spam even before API rate limits.
+@@ -90,6 +93,7 @@ export function publicRooms(db,playerId){
+ }
+ export function joinRoom(db,playerId,code,{expected_version,command_id}={}){
+  return transaction(db,()=>{
++  bindCommand(db,playerId,command_id,{operation:'room.join',code:String(code).toUpperCase(),expected_version});
+   const room=findRoom(db,String(code).toUpperCase(),playerId,false);
+   return processOnce(db,playerId,command_id,room.id,()=>{
+    openRoom(room);checkVersion(room,expected_version);
+@@ -112,6 +116,7 @@ export function roomAction(db,playerId,id,{action,expected_version,command_id}={
+  return transaction(db,()=>{
+   // Replay must work even after LEAVE removed the actor's membership.
+   commandId(command_id);
++  bindCommand(db,playerId,command_id,{operation:'room.action',id,action,expected_version});
+   const already=db.prepare('SELECT room_id,response_json FROM multiplayer_commands WHERE tenant_id=? AND player_id=? AND command_id=?').get('wa-world',playerId,command_id);
+   if(already){assert(already.room_id===id,409,'COMMAND_REUSED_FOR_OTHER_ROOM');return parse(already.response_json);}
+   const room=findRoom(db,id,playerId);
+diff --git a/src/roulette-rounds.mjs b/src/roulette-rounds.mjs
+index 5509043..ab19965 100644
+--- a/src/roulette-rounds.mjs
++++ b/src/roulette-rounds.mjs
+@@ -1,6 +1,7 @@
++import {postTransfer as transfer} from './val/ledger.mjs';
+ import {randomInt} from 'node:crypto';
+ import {assert,uuid,now,json,parse,fail} from './util.mjs';
+-import {transaction,transfer,accountId,wallet} from './db.mjs';
++import {transaction,accountId,wallet} from './db.mjs';
+ import {policy,checkStake,tenantFor,once,reserve,releaseReserve} from './stake-policy.mjs';
+ import {roundAudit,roundEvent} from './lottery.mjs';
+ export const RED=new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
+diff --git a/src/server.mjs b/src/server.mjs
+index a8687e7..27a0834 100644
+--- a/src/server.mjs
++++ b/src/server.mjs
+@@ -1,3 +1,4 @@
++import {valApi} from './val/api.mjs';
+ import {migrateActiveLiabilities} from './migrations.mjs';
+ import {rcAdmin,rcPlayer,isRcRoute} from './rc-api.mjs';
+ import {sweepLottery} from './lottery.mjs';
+@@ -17,7 +18,6 @@ import {economyOverview} from './economy-overview.mjs';
+ import {setupAdminSchema,adminLogin,adminSession,adminLogout,adminPlayers,adminDashboard,adminRecentAdjustments,adminAdjust} from './admin.mjs';
+ const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+ function getEnv(){const filename=path.join(root,'.env');if(!fs.existsSync(filename))return;for(const line of fs.readFileSync(filename,'utf8').split(/\r?\n/)){const m=line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)\s*$/);if(m&&!process.env[m[1]])process.env[m[1]]=m[2].trim();}}
+-getEnv();
+ const remoteAllowed=addr=>['127.0.0.1','::1','::ffff:127.0.0.1'].includes(addr);
+ const getCookies=req=>Object.fromEntries((req.headers.cookie||'').split(';').map(v=>v.trim().split('=').slice(0,2)).filter(x=>x.length===2).map(([k,v])=>[k,decodeURIComponent(v)]));
+ const jsonResponse=(res,status,value,headers={})=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store',...headers});res.end(json(value));};
+@@ -152,7 +152,7 @@ export function createApp({database=':memory:',serviceKey=process.env.WAE_SERVIC
+       const id=transaction(db,()=>ensurePlayer(db,subject));return jsonResponse(res,200,{player_id:id,balance:wallet(db,id),sessions:sessionsFor(db,id)});
+     }
+     if(req.method==='POST'&&pathname==='/internal/v1/games/create'){
+-      const id=transaction(db,()=>ensurePlayer(db,subject));const result=createGame(db,id,b.game_code,b.bet);emit(result.session.id,result);return jsonResponse(res,201,result);
++      const id=transaction(db,()=>ensurePlayer(db,subject));const result=createGame(db,id,b.game_code,b.bet,b.command_id);emit(result.session.id,result);return jsonResponse(res,201,result);
+     }
+     if(req.method==='POST'&&pathname==='/internal/v1/games/action'){
+       const id=transaction(db,()=>ensurePlayer(db,subject));const result=act(db,id,b.session_id,b);emit(result.session.id,result);return jsonResponse(res,200,result);
+@@ -181,12 +181,13 @@ export function createApp({database=':memory:',serviceKey=process.env.WAE_SERVIC
+       db.prepare('INSERT INTO browser_sessions VALUES(?,?,?,?,?,?,?,?)').run(sessionId,'wa-world',id,digest(secret),now(),now()+7*86400000,null,'Local Demo');
+       res.setHeader('Set-Cookie',cookie(sessCookie,secret,secure));return jsonResponse(res,200,{ok:true});
+    }
++   if(pathname.startsWith('/api/val/v1/'))return jsonResponse(res,200,valApi(db,auth(req),req.method,pathname.slice('/api/val/v1'.length),url.searchParams,b));
+    if(req.method==='GET'&&pathname==='/api/v1/me'){
+       const s=auth(req);return jsonResponse(res,200,{player_id:s.player_id,device_label:s.device_label,balance:wallet(db,s.player_id),demo});
+    }
+    if(req.method==='GET'&&pathname==='/api/v1/wallet'){
+       const s=auth(req);const tx=db.prepare(`SELECT t.id,t.reason,t.created_ms,SUM(e.delta) AS delta FROM transfers t JOIN entries e ON e.transfer_id=t.id JOIN accounts a ON e.account_id=a.id WHERE a.owner_id=? GROUP BY t.id ORDER BY t.created_ms DESC LIMIT 30`).all(s.player_id);
+-      return jsonResponse(res,200,{currency:'ACR',balance:wallet(db,s.player_id),transactions:tx});
++      return jsonResponse(res,200,{currency:'ACR',val_currency:'VAL',pocket:'arcade',balance:wallet(db,s.player_id),transactions:tx});
+    }
+ 
+    if(pathname==='/api/v1/notifications/events'&&req.method==='GET'){
+@@ -259,7 +260,7 @@ export function createApp({database=':memory:',serviceKey=process.env.WAE_SERVIC
+       const s=auth(req);return jsonResponse(res,200,{sessions:sessionsFor(db,s.player_id)});
+    }
+    if(req.method==='POST'&&pathname==='/api/v1/sessions'){
+-      const s=auth(req);const result=createGame(db,s.player_id,b.game_code,b.bet);emit(result.session.id,result);return jsonResponse(res,201,result);
++      const s=auth(req);const result=createGame(db,s.player_id,b.game_code,b.bet,b.command_id);emit(result.session.id,result);return jsonResponse(res,201,result);
+    }
+    const match=pathname.match(/^\/api\/v1\/sessions\/([a-f0-9]{32})(?:\/(actions|events))?$/);
+    if(match){
+@@ -309,6 +310,7 @@ export function createApp({database=':memory:',serviceKey=process.env.WAE_SERVIC
+  return {server,db,close:()=>new Promise(resolve=>{clearInterval(blackjackSweep);server.close(()=>{db.close();resolve();});})};
+ }
+ if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)){
++ getEnv();
+  const host=process.env.WAE_HOST||'127.0.0.1';const port=Number(process.env.WAE_PORT||8787);
+  const config={host,database:path.join(root,'data','arcade.sqlite'),serviceKey:process.env.WAE_SERVICE_TOKEN,demo:process.env.WAE_DEMO_MODE==='1'};
+  if(host!=='127.0.0.1'&&process.env.WAE_COOKIE_SECURE!=='1'){
+diff --git a/src/stake-policy.mjs b/src/stake-policy.mjs
+index a0a0bfa..04de2b3 100644
+--- a/src/stake-policy.mjs
++++ b/src/stake-policy.mjs
+@@ -1,5 +1,8 @@
++import {canonical} from './val/commands.mjs';
++import {heldAmount} from './val/ledger.mjs';
++import {postTransfer as transfer} from './val/ledger.mjs';
+ import {assert,uuid,json,parse,now,digest} from './util.mjs';
+-import {transaction,audit,transfer} from './db.mjs';
++import {transaction,audit} from './db.mjs';
+ export const SAFETY_CEILING=10000;
+ export const DEFAULT_POLICY=Object.freeze({min:1,max:3000,presets:[1,10,100,500,1000,3000],maxDigits:12});
+ export function tenantFor(db,p){const t=db.prepare('SELECT tenant_id FROM players WHERE id=?').get(p)?.tenant_id;assert(t==='wa-world',403,'TENANT_NOT_SUPPORTED');return t;}
+@@ -12,7 +15,7 @@ export function policy(db,game='*',tenant='wa-world'){
+ export function checkStake(amount,p){assert(Number.isSafeInteger(amount)&&amount>0,400,'INVALID_BET');assert(amount>=p.min,400,'BET_TOO_LOW');assert(amount<=p.max&&amount<=SAFETY_CEILING,400,'BET_TOO_HIGH');return amount;}
+ export function once(db,actor,cmd,payload,fn,tenant='wa-world'){
+  assert(typeof cmd==='string'&&/^[A-Za-z0-9:_-]{12,100}$/.test(cmd),400,'INVALID_COMMAND_ID');
+- const fingerprint=digest(json(payload));
++ const fingerprint=digest(json(canonical(payload)));
+  return transaction(db,()=>{const old=db.prepare('SELECT * FROM rc_commands WHERE tenant_id=? AND actor=? AND command_id=?').get(tenant,actor,cmd);
+  if(old){assert(old.fingerprint===fingerprint,409,'COMMAND_PAYLOAD_MISMATCH');return parse(old.response_json);}
+  const result=parse(json(fn()));db.prepare('INSERT INTO rc_commands VALUES(?,?,?,?,?)').run(tenant,actor,cmd,fingerprint,json(result));return result;});
+@@ -25,7 +28,7 @@ export function setPolicy(db,admin,input){assert(admin?.role==='ADMIN',403,'ADMI
+  db.prepare('INSERT INTO stake_policies VALUES(?,?,1,?) ON CONFLICT(tenant_id,game_code) DO UPDATE SET version=version+1,policy_json=excluded.policy_json').run('wa-world',game_code,json(next));
+  db.prepare('INSERT INTO policy_audit VALUES(?,?,?,?,?,?)').run(uuid(),'wa-world',admin.id,json(before),json(next),now());audit(db,'stake.policy.changed',{actor:admin.id,game_code,before,next});return policy(db,game_code);});
+ }
+-export function reserve(db,id,amount){assert(Number.isSafeInteger(amount)&&amount>=0,400,'INVALID_EXPOSURE');const other=db.prepare('SELECT COALESCE(SUM(amount),0) n FROM treasury_reserves WHERE tenant_id=? AND id<>?').get('wa-world',id).n;
++export function reserve(db,id,amount){assert(Number.isSafeInteger(amount)&&amount>=0,400,'INVALID_EXPOSURE');const other=db.prepare('SELECT COALESCE(SUM(amount),0) n FROM treasury_reserves WHERE tenant_id=? AND id<>?').get('wa-world',id).n;assert(Number.isSafeInteger(other)&&Number.isSafeInteger(other+amount),400,'RESERVE_OVERFLOW');
+  const balance=db.prepare("SELECT balance FROM accounts WHERE id='wa-treasury'").get().balance;assert(balance-other>=amount,409,'TREASURY_RESERVE_INSUFFICIENT');db.prepare('INSERT INTO treasury_reserves VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET amount=excluded.amount').run(id,'wa-world',amount);}
+ export const releaseReserve=(db,id)=>db.prepare('DELETE FROM treasury_reserves WHERE id=?').run(id);
+ 
+diff --git a/web/src/App.jsx b/web/src/App.jsx
+index 71ce372..5acec2b 100644
+--- a/web/src/App.jsx
++++ b/web/src/App.jsx
+@@ -1,3 +1,4 @@
++import ValWallet from './components/ValWallet.jsx';
+ import RoundLobby from './components/RoundLobby.jsx';
+ import HelpCenter from './components/HelpCenter.jsx';
+ import GettingStarted from './components/GettingStarted.jsx';
+@@ -10,7 +11,7 @@ import MultiplayerHub from './components/MultiplayerHub.jsx';
+ 
+ const ICONS = {'A1-01':'🎰','A1-02':'✨','A1-03':'🏺','A1-04':'⚡','A1-05':'🌌','B1':'🎯','B2':'🃏','L1':'🔢'};
+ const META = {'A1-01':{name:'Classic Match',genre:'SLOT · A1 SERIES',level:'CASUAL',className:'slot'},'A1-02':{name:'Scatter Rush',genre:'SLOT · A1 SERIES',level:'BONUS',className:'slot'},'A1-03':{name:'Mystery Guci',genre:'SLOT · A1 SERIES',level:'REWARDS',className:'slot'},'A1-04':{name:'Column Blast',genre:'SLOT · A1 SERIES',level:'TRANSFORM',className:'slot'},'A1-05':{name:'Ultimate Fusion',genre:'SLOT · A1 SERIES',level:'FUSION',className:'slot'},'B1':{name:'European Roulette',genre:'TABLE · EUROPEAN',level:'CLASSIC',className:'roulette'},'B2':{name:'Blackjack 21',genre:'TABLE · SINGLE PLAYER',level:'STRATEGY',className:'blackjack'},'L1':{name:'Lottery Exclusive',genre:'SCHEDULED · ACR',level:'DRAW',className:'roulette'}};
+-const NAV = [ ['lobby',House,'Beranda'],['slot',Sparkles,'Slot A1'],['arcade',Gamepad2,'Arcade'],['multiplayer',Dice5,'Multiplayer Arcade'], ['lottery',Target,'Lottery Exclusive'], ['games',Layers3,'Semua Game'],['sessions',Layers3,'Sesi Bermain'],['wallet',Wallet,'ACR Wallet'],['help',BookOpen,'Panduan & Bantuan'],['security',ShieldCheck,'Keamanan'], ['admin',KeyRound,'Admin ACR'] ];
++const NAV = [ ['lobby',House,'Beranda'],['slot',Sparkles,'Slot A1'],['arcade',Gamepad2,'Arcade'],['multiplayer',Dice5,'Multiplayer Arcade'], ['lottery',Target,'Lottery Exclusive'], ['games',Layers3,'Semua Game'],['sessions',Layers3,'Sesi Bermain'],['wallet',Wallet,'EV-wallet VAL'],['help',BookOpen,'Panduan & Bantuan'],['security',ShieldCheck,'Keamanan'], ['admin',KeyRound,'Admin ACR'] ];
+ const RED = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
+ const ERR_OFFLINE = 'Tidak bisa menghubungi server WAE. Periksa START.bat.';
+ function IconButton({icon:Comp,title,onClick,className='',disabled=false}) {return <button className={`icon-button ${className}`} aria-label={title} title={title} onClick={onClick} disabled={disabled}><Comp size={19}/></button>}
+@@ -32,12 +33,11 @@ function Login({health,onDemo,busy}){return <div className="auth-shell"><div cla
+ function Stat({icon:I,label,value,note,tone=''}){return <div className={`stat-card ${tone}`}><div className="stat-icon"><I size={20}/></div><div><div className="stat-label">{label}</div><strong>{value}</strong><div className="stat-note">{note}</div></div></div>}
+ function GameArtwork({code,large=false}){const m=META[code]??META['A1-01'];return <div className={`game-art art-${m.className} ${large?'art-large':''}`} aria-hidden="true"><div className="art-glow"/>{(code==='A1-01'||code==='A1-02'||code==='A1-03'||code==='A1-04'||code==='A1-05')?<div className="art-slot"><span>7</span><span>★</span><span>7</span></div>:code==='B1'?<div className="art-wheel"><div>✦</div></div>:<div className="art-cards"><span>A♠</span><span>J♥</span></div>}<div className="art-noise"/></div>}
+ function GameCard({code,name,description,onPlay,onGuide,featured=false}){const meta=META[code];return <div className={`catalog-card rc3-catalog ${featured?'featured':''}`}><button type="button" className="rc3-catalog-play" onClick={()=>onPlay(code)}><GameArtwork code={code}/><div className="catalog-body"><div className="catalog-meta"><span>{meta?.genre??code}</span><Pill kind="muted">{meta?.level??'ARCADE'}</Pill></div><strong>{meta?.name??name}</strong><p>{description}</p><span className="catalog-action">Mulai bermain <ArrowRight size={16}/></span></div></button><button type="button" className="rc3-catalog-help" onClick={()=>onGuide(code)} aria-label={`Cara bermain ${meta?.name??name}`}><BookOpen size={16}/> Cara main</button></div>}
+-function Header({page,me,balance,online,setMobileOpen,navigate,onRefresh}){const pageTitle={roulette:'European Roulette',multiplayer:'Multiplayer Arcade',lobby:'Arcade Lobby',games:'Game Library',slot:'Slot A1 Series',arcade:'Arcade Classic',lottery:'Lottery Exclusive',sessions:'My Sessions',wallet:'ACR Wallet',security:'Security Center',help:'Panduan & Bantuan',admin:'Admin Center',play:'Playing Now'};return <header className="header"><div className="page-name"><IconButton icon={Menu} title="Buka menu" className="mobile-menu" onClick={()=>setMobileOpen(true)}/><div><div className="breadcrumb">WORLD ARCADE <ChevronRight size={13}/> {page==='play'?'PLAY':page.toUpperCase()}</div><h2>{pageTitle[page]}</h2></div></div><div className="header-right"><span className={`connection ${online?'connected':'disconnected'}`}><span/>{online?(page==='play'?'Live Sync':'Engine Online'):'Reconnecting'}</span><button className="balance-chip" onClick={()=>navigate('wallet')}><Coins size={17}/><strong>{money(balance)}</strong><span>ACR</span></button><IconButton icon={RefreshCw} title="Segarkan data" onClick={onRefresh}/><div className="header-avatar">{(me?.player_id??'W')[0].toUpperCase()}</div></div></header>}
++function Header({page,me,balance,online,setMobileOpen,navigate,onRefresh}){const pageTitle={roulette:'European Roulette',multiplayer:'Multiplayer Arcade',lobby:'Arcade Lobby',games:'Game Library',slot:'Slot A1 Series',arcade:'Arcade Classic',lottery:'Lottery Exclusive',sessions:'My Sessions',wallet:'EV-wallet VAL',security:'Security Center',help:'Panduan & Bantuan',admin:'Admin Center',play:'Playing Now'};return <header className="header"><div className="page-name"><IconButton icon={Menu} title="Buka menu" className="mobile-menu" onClick={()=>setMobileOpen(true)}/><div><div className="breadcrumb">WORLD ARCADE <ChevronRight size={13}/> {page==='play'?'PLAY':page.toUpperCase()}</div><h2>{pageTitle[page]}</h2></div></div><div className="header-right"><span className={`connection ${online?'connected':'disconnected'}`}><span/>{online?(page==='play'?'Live Sync':'Engine Online'):'Reconnecting'}</span><button className="balance-chip" onClick={()=>navigate('wallet')}><Coins size={17}/><strong>{money(balance)}</strong><span>VAL</span></button><IconButton icon={RefreshCw} title="Segarkan data" onClick={onRefresh}/><div className="header-avatar">{(me?.player_id??'W')[0].toUpperCase()}</div></div></header>}
+ function Lobby({games,sessions,balance,onPlay,onResume,navigate,onGuide}){return <><section className="hero"><div className="hero-copy"><Pill kind="glow"><Sparkles size={13}/> DUAL MODE EXPERIENCE</Pill><h1>Your arcade.<br/><em>Your rules.</em></h1><p>Bermain di Web dengan visual lebih hidup. Lanjutkan permainan yang sama melalui WA-WORLD kapan saja.</p><div className="hero-actions"><button className="btn primary" onClick={()=>navigate('games')}>Explore Games <ArrowRight size={17}/></button><button className="btn outline" onClick={()=>navigate('sessions')}><History size={17}/> Lanjutkan sesi</button></div><div className="hero-foot"><span><span className="signal"/> SINGLE GAME STATE</span><span>·</span><span>WEB × WHATSAPP</span></div></div><div className="hero-decor"><div className="hero-orbit orbit-one"/><div className="hero-orbit orbit-two"/><div className="hero-coin">W<span>✦</span></div><div className="hero-spark one">✦</div><div className="hero-spark two">✧</div></div></section><GettingStarted balance={balance} sessions={sessions} navigate={navigate}/><div className="section-title"><div><span className="eyebrow">THE COLLECTION</span><h2>Featured games</h2></div><button className="subtle-link" onClick={()=>navigate('games')}>View all <ArrowRight size={17}/></button></div><div className="game-grid">{games.map(g=><GameCard key={g.code} {...g} onPlay={onPlay} onGuide={onGuide}/>)}</div><div className="dashboard-bottom"><div className="panel"><div className="panel-head"><div><span className="eyebrow">PICK UP WHERE YOU LEFT OFF</span><h3>Sesi terakhir</h3></div><IconButton icon={ArrowRight} title="Semua sesi" onClick={()=>navigate('sessions')}/></div><SessionsList sessions={sessions.slice(0,4)} onResume={onResume}/></div><div className="mini-panel"><div className="mini-panel-icon"><ArrowRightLeft size={22}/></div><h3>One game, two worlds.</h3><p>Semua perubahan game tersimpan di server. Pindah perangkat tanpa menggandakan aksi dan saldo.</p><button className="subtle-link" onClick={()=>navigate('security')}>Atur koneksi <ArrowRight size={16}/></button></div></div></>}
+ function GamesView({games,onPlay,onGuide,category='all'}){const [query,setQuery]=useState('');const visible=(category==='all'?games:games.filter(g=>g.category===category)).filter(g=>!query.trim()||[g.code,g.name,g.description,META[g.code]?.name].join(' ').toLocaleLowerCase('id-ID').includes(query.trim().toLocaleLowerCase('id-ID')));return <><div className="view-intro"><span className="eyebrow">CHOOSE YOUR EXPERIENCE</span><h1>{category==='slot'?'Slot A1 Series':category==='arcade'?'Arcade Classic':category==='lottery'?'Lottery Exclusive':'Game Library'}</h1><p>{category==='lottery'?'Undian bersama memakai tiket ACR virtual, jadwal dan seed commitment.':category==='arcade'?'European Roulette dan Blackjack solo, seluruh hasil dihitung engine server.':'Classic Match, Scatter Rush, Mystery Guci, Column Blast, dan Ultimate Fusion menggunakan ACR terpisah dari VCUR.'}</p></div><label className="rc3-search-library"><BookOpen size={17}/><input type="search" value={query} onChange={e=>setQuery(e.target.value)} placeholder="Cari nama atau kode permainan…" aria-label="Cari permainan"/></label>{visible.length===0&&<div className="panel">Tidak ada game sesuai pencarian. Ubah kata kunci atau pilih kategori lain.</div>}<div className="game-grid library-grid">{visible.map(g=><GameCard key={g.code} {...g} onPlay={onPlay} onGuide={onGuide}/>)}</div>{category!=='lottery'&&<div className="coming-soon"><Zap size={21}/><div><strong>A1 ROADMAP</strong><p>Ultimate Fusion tersedia: Scatter, Guci dan Blast dalam satu sesi. Semua hadiah dihitung server dan memakai ACR.</p></div></div>}</>}
+ function SessionsList({sessions,onResume}){return sessions.length?<div className="session-list">{sessions.map(s=><button className="session-item" key={s.id} onClick={()=>onResume(s.id)}><span className="session-ico">{ICONS[s.game_code]||'🎮'}</span><span className="session-content"><strong>{META[s.game_code]?.name??s.game_code}</strong><small>#{shortId(s.id)} · versi {s.version} · {clock(s.updated_ms)}</small></span><ArrowRight size={18}/></button>)}</div>:<div className="empty-list"><Layers3 size={24}/><p>Belum ada sesi permainan.</p></div>}
+ function SessionsView({sessions,onResume,navigate}){return <><div className="view-intro"><span className="eyebrow">SAVED ON THE ENGINE</span><h1>Sesi Bermain</h1><p>Sesi tersimpan di server WAE, bukan di browser. Klik salah satu untuk membuka state terbaru.</p></div><div className="panel sessions-panel"><SessionsList sessions={sessions} onResume={onResume}/></div><button className="btn outline top-gap" onClick={()=>navigate('games')}>Cari permainan <ArrowRight size={17}/></button></>}
+-function WalletView({balance,transactions}){return <><div className="view-intro"><span className="eyebrow">INDEPENDENT ARCADE ECONOMY</span><h1>ACR Wallet</h1><p>Dompet khusus World Arcade Engine. Terpisah sepenuhnya dari V-Currency milik WA-WORLD.</p></div><div className="wallet-feature"><div><span>AVAILABLE CREDIT</span><div className="wallet-amount">{money(balance)} <small>ACR</small></div><p><ShieldCheck size={16}/> Tidak bisa ditransfer ke VCUR, ditarik sebagai uang, atau diperjualbelikan.</p></div><div className="wallet-art"><Coins size={66}/></div></div><div className="panel"><div className="panel-head"><div><span className="eyebrow">LEDGER ACTIVITY</span><h3>Riwayat transaksi</h3></div><Pill>ACR ONLY</Pill></div>{transactions.length?<div className="transaction-list">{transactions.map((t,i)=><div className="transaction" key={`${t.id}-${i}`}><div className={`transaction-icon ${t.delta>=0?'incoming':'outgoing'}`}>{t.delta>=0?<ArrowDownRight size={18}/>:<ArrowRight size={18}/>}</div><div><strong>{t.reason||'Arcade activity'}</strong><small>{clock(t.created_ms)}</small></div><strong className={t.delta>=0?'positive':'negative'}>{t.delta>0?'+':''}{money(t.delta)} ACR</strong></div>)}</div>:<div className="empty-list">Belum ada aktivitas transaksi.</div>}</div></>}
+ function SecurityView({devices,onRevoke,onLogout,onLink,waLink,busy,refreshDevices}){return <><div className="view-intro"><span className="eyebrow">YOUR ACCOUNT, YOUR CONTROL</span><h1>Security Center</h1><p>Kontrol perangkat Web yang masuk, dan aktivasi koneksi WhatsApp secara terverifikasi.</p></div><div className="security-grid"><div className="panel"><div className="panel-head"><div><span className="eyebrow">TRUSTED CONNECTION</span><h3>Hubungkan WA-WORLD</h3></div><Smartphone size={20}/></div><p className="panel-desc">Hubungkan kontrol WhatsApp dari perangkat yang memang Anda gunakan. Kedua sisi harus menyetujui kode yang sama.</p>{waLink?<div className="link-flow"><div className="auth-code small">{waLink.code}</div><p>Di DM WA-WORLD, kirim <code>.wae link {waLink.code}</code>, lalu <code>.wae confirm {waLink.code}</code>.</p><Pill>Status: {waLink.status}</Pill><div className="link-buttons"><button className="btn outline" onClick={waLink.refresh} disabled={busy}><RefreshCw size={16}/> Cek status</button><button className="btn primary" onClick={waLink.finish} disabled={busy}><Check size={16}/> Selesaikan</button></div></div>:<button className="btn primary" disabled={busy} onClick={onLink}><Link2 size={17}/> Aktifkan WhatsApp</button>}</div><div className="panel"><div className="panel-head"><div><span className="eyebrow">WEB ACCESS</span><h3>Perangkat aktif</h3></div><IconButton icon={RefreshCw} title="Segarkan" onClick={refreshDevices}/></div><div className="device-list">{devices?.devices?.map(d=><div className="device-row" key={d.id}><div className="device-icon"><MonitorSmartphone size={19}/></div><div><strong>{d.device_label||'Web Browser'}</strong><small>{d.id===devices.current_id?'Perangkat ini · ':''}Login {clock(d.created_ms)}</small></div><button onClick={()=>onRevoke(d.id,d.id===devices.current_id)} disabled={busy} title="Cabut akses">Cabut</button></div>)}{!devices?.devices?.length&&<div className="empty-list">Belum ada perangkat.</div>}</div><button className="btn ghost danger-text" onClick={onLogout}><LogOut size={16}/> Keluar dari Web</button></div></div><div className="security-note"><LockKeyhole size={19}/><div><strong>Protected by design</strong><p>Token konektor WA-WORLD tidak pernah diberikan kepada browser. Semua akses saldo dan game diautorisasi di backend.</p></div></div></>}
+ export default function App(){
+  const [health,setHealth]=useState(null),[me,setMe]=useState(null),[booting,setBooting]=useState(true),[busy,setBusy]=useState(false),[mobileOpen,setMobileOpen]=useState(false);
+@@ -72,7 +72,7 @@ export default function App(){
+    finally{requestLocked.current=false;setBusy(false)}
+  },[showError]);
+  const demoLogin=()=>withBusy(async()=>{await api('POST','/api/v1/demo-login',{});await login();notify('Mode demo lokal aktif. Selamat bermain!')});
+- const startGame=code=>code==='L1'?navigate('lottery'):code==='B1'?navigate('roulette'):withBusy(async()=>{const result=await api('POST','/api/v1/sessions',{game_code:code,bet});await loadGame(result.session.id);await refreshData();notify('Game dimulai, selamat bermain!')});
++ const startGame=code=>code==='L1'?navigate('lottery'):code==='B1'?navigate('roulette'):withBusy(async()=>{const result=await api('POST','/api/v1/sessions',{game_code:code,bet,command_id:crypto.randomUUID()});await loadGame(result.session.id);await refreshData();notify('Game dimulai, selamat bermain!')});
+  const actNow=(action,extra={})=>withBusy(async()=>{
+    const current=sessionRef.current;if(!current)return false;
+    try{
+@@ -97,5 +97,5 @@ export default function App(){
+  const showSessions=page==='sessions',loggedIn=Boolean(me);
+  if(booting)return <FullLoading/>;
+  if(refCode || !loggedIn){return <><Toast item={toast} clear={clearToast}/>{refCode?<DeviceLink refCode={refCode} health={health} onLogin={login} onNotify={notify} working={busy}/>:<Login health={health} onDemo={demoLogin} busy={busy}/>}</>}
+- return <div className="app-shell"><Sidebar page={page==='play'?'games':page} navigate={navigate} open={mobileOpen} setOpen={setMobileOpen} me={me} onLogout={logout}/><div className="content-shell"><Header page={page} me={me} balance={balance} online={page==='play'?sync==='connected':Boolean(health?.ok)} setMobileOpen={setMobileOpen} navigate={navigate} onRefresh={()=>withBusy(refreshData)}/><main className="main-content">{page==='lobby'&&<Lobby games={games} sessions={sessions} balance={balance} onPlay={startGame} onResume={openGame} navigate={navigate} onGuide={openGuide}/>} {page==='roulette'&&<RoundLobby kind="roulette" onBalance={setBalance} onNotify={notify}/>} {page==='lottery'&&<RoundLobby kind="lottery" onBalance={setBalance} onNotify={notify} onHelp={()=>navigate('help')} onAdmin={()=>navigate('admin')}/>} {page==='help'&&<HelpCenter navigate={navigate} gameCode={guideCode}/>} {page==='multiplayer'&&<MultiplayerHub onNotify={notify} onBalance={setBalance}/>} {['games','slot','arcade'].includes(page)&&<GamesView games={games} onPlay={startGame} onGuide={openGuide} category={page==='games'?'all':page}/>} {showSessions&&<SessionsView sessions={sessions} onResume={openGame} navigate={navigate}/>} {page==='wallet'&&<WalletView balance={balance} transactions={transactions}/>} {page==='play'&&<GamePanel session={session} balance={balance} bet={bet} onBet={setBet} actNow={actNow} busy={busy} syncStatus={sync} refresh={()=>openGame(session.id)} navigate={navigate} onGuide={()=>openGuide(session.game_code)}/>} {page==='admin'&&<AdminView enabled={health?.admin_test_available} notify={notify} onRefreshWallet={refreshData}/>} {page==='security'&&<SecurityView devices={devices} onRevoke={revoke} onLogout={logout} onLink={onLink} busy={busy} waLink={waLink&&{...waLink,refresh:refreshLink,finish:finishLink}} refreshDevices={()=>withBusy(refreshData)}/>}<footer className="footer"><span>© WORLD ARCADE ENGINE</span><span>VIRTUAL CREDITS ONLY · NO VCUR CONVERSION · BUILD v1.0.0-rc.3</span></footer></main><nav className="rc3-mobile-tabs" aria-label="Navigasi cepat ponsel">{[['lobby',House,'Beranda'],['games',Gamepad2,'Game'],['sessions',History,'Sesi'],['help',BookOpen,'Bantuan'],['wallet',Wallet,'ACR']].map(([k,I,label])=><button key={k} className={page===k?'active':''} aria-current={page===k?'page':undefined} onClick={()=>navigate(k)}><I size={19}/><span>{label}</span></button>)}</nav></div><Toast item={toast} clear={clearToast}/></div>;
++ return <div className="app-shell"><Sidebar page={page==='play'?'games':page} navigate={navigate} open={mobileOpen} setOpen={setMobileOpen} me={me} onLogout={logout}/><div className="content-shell"><Header page={page} me={me} balance={balance} online={page==='play'?sync==='connected':Boolean(health?.ok)} setMobileOpen={setMobileOpen} navigate={navigate} onRefresh={()=>withBusy(refreshData)}/><main className="main-content">{page==='lobby'&&<Lobby games={games} sessions={sessions} balance={balance} onPlay={startGame} onResume={openGame} navigate={navigate} onGuide={openGuide}/>} {page==='roulette'&&<RoundLobby kind="roulette" onBalance={setBalance} onNotify={notify}/>} {page==='lottery'&&<RoundLobby kind="lottery" onBalance={setBalance} onNotify={notify} onHelp={()=>navigate('help')} onAdmin={()=>navigate('admin')}/>} {page==='help'&&<HelpCenter navigate={navigate} gameCode={guideCode}/>} {page==='multiplayer'&&<MultiplayerHub onNotify={notify} onBalance={setBalance}/>} {['games','slot','arcade'].includes(page)&&<GamesView games={games} onPlay={startGame} onGuide={openGuide} category={page==='games'?'all':page}/>} {showSessions&&<SessionsView sessions={sessions} onResume={openGame} navigate={navigate}/>} {page==='wallet'&&<ValWallet onBalance={setBalance}/>} {page==='play'&&<GamePanel session={session} balance={balance} bet={bet} onBet={setBet} actNow={actNow} busy={busy} syncStatus={sync} refresh={()=>openGame(session.id)} navigate={navigate} onGuide={()=>openGuide(session.game_code)}/>} {page==='admin'&&<AdminView enabled={health?.admin_test_available} notify={notify} onRefreshWallet={refreshData}/>} {page==='security'&&<SecurityView devices={devices} onRevoke={revoke} onLogout={logout} onLink={onLink} busy={busy} waLink={waLink&&{...waLink,refresh:refreshLink,finish:finishLink}} refreshDevices={()=>withBusy(refreshData)}/>}<footer className="footer"><span>© WORLD ARCADE ENGINE</span><span>VIRTUAL CREDITS ONLY · NO VCUR CONVERSION · BUILD v1.0.0-rc.3</span></footer></main><nav className="rc3-mobile-tabs" aria-label="Navigasi cepat ponsel">{[['lobby',House,'Beranda'],['games',Gamepad2,'Game'],['sessions',History,'Sesi'],['help',BookOpen,'Bantuan'],['wallet',Wallet,'VAL']].map(([k,I,label])=><button key={k} className={page===k?'active':''} aria-current={page===k?'page':undefined} onClick={()=>navigate(k)}><I size={19}/><span>{label}</span></button>)}</nav></div><Toast item={toast} clear={clearToast}/></div>;
+ }
+--- /dev/null
++++ b/scripts/dev-val.mjs
+@@ -0,0 +1,5 @@
++// In-memory demonstration only; never opens data/arcade.sqlite or loads .env.
++import {createApp} from '../src/server.mjs';
++const app=createApp({database:':memory:',demo:true,host:'127.0.0.1',serviceKey:''});
++app.server.listen(3210,'127.0.0.1',()=>console.log('EV-wallet VAL demo: http://127.0.0.1:3210 (in-memory; resets on exit)'));
++for(const signal of ['SIGINT','SIGTERM'])process.on(signal,async()=>{await app.close();process.exit(0)});
+--- /dev/null
++++ b/scripts/migrate-val.mjs
+@@ -0,0 +1,22 @@
++// Explicit offline operation. Default is a SQLite backup into a disposable staging DB.
++import {DatabaseSync,backup} from 'node:sqlite';
++import {mkdtempSync,rmSync} from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import {migrateVal,registerValWriter,reconcileVal,hasValSchema} from '../src/val/schema.mjs';
++const [filename,flag]=process.argv.slice(2);
++if(!filename||!['--dry-run','--apply',undefined].includes(flag))throw new Error('Usage: node --experimental-sqlite scripts/migrate-val.mjs <staging.sqlite> [--dry-run|--apply]');
++let db,temp;
++try{
++ if(flag==='--apply')db=new DatabaseSync(path.resolve(filename));
++ else{
++  temp=mkdtempSync(path.join(os.tmpdir(),'val-migration-'));
++  const source=new DatabaseSync(path.resolve(filename),{readOnly:true});
++  try{await backup(source,path.join(temp,'fixture.sqlite'));}finally{source.close();}
++  db=new DatabaseSync(path.join(temp,'fixture.sqlite'));
++ }
++ registerValWriter(db);
++ const before=reconcileVal(db,{legacy:!hasValSchema(db)});
++ if(!before.ok){console.log(JSON.stringify({mode:flag??'--dry-run',applied:false,reconciliation:before},null,2));process.exitCode=1;}
++ else console.log(JSON.stringify({mode:flag??'--dry-run',...migrateVal(db)},null,2));
++}finally{db?.close();if(temp)rmSync(temp,{recursive:true,force:true});}
+--- /dev/null
++++ b/tests/val.test.mjs
+@@ -0,0 +1,150 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {randomUUID} from 'node:crypto';
++import {DatabaseSync} from 'node:sqlite';
++import {Worker} from 'node:worker_threads';
++import {once as eventOnce} from 'node:events';
++import {mkdtempSync,rmSync} from 'node:fs';
++import {spawnSync} from 'node:child_process';
++import os from 'node:os';
++import path from 'node:path';
++import {openDb,transaction,ensurePlayer,wallet,accountId} from '../src/db.mjs';
++import {postTransfer,readWallet,readHistory,readReceipt,heldAmount} from '../src/val/ledger.mjs';
++import {migrateVal,reconcileVal,hasValSchema} from '../src/val/schema.mjs';
++import {playSafety,updateSafety} from '../src/val/play-safety.mjs';
++import {createGame,act,getSession} from '../src/games.mjs';
++import {reserve} from '../src/stake-policy.mjs';
++import {setupRooms,createRoom,joinRoom,roomAction} from '../src/rooms.mjs';
++import {setupBlackjackTables,createBlackjackTable,blackjackTableAction} from '../src/blackjack-tables.mjs';
++import {initialFusionState,resolveFusionSpin,POT} from '../src/ultimate-fusion.mjs';
++import {createRoulette,submitSlip,rouletteAdminAction,rouletteView} from '../src/roulette-rounds.mjs';
++import {createLottery,lotteryAdminAction,buyLotteryTicket,lotteryView,lotteryNumber,sweepLottery} from '../src/lottery.mjs';
++const cmd=()=>randomUUID(),admin={id:'val-fixture-admin',role:'ADMIN'};
++function fixture(file){const db=openDb(file);setupRooms(db);setupBlackjackTables(db);const a=transaction(db,()=>ensurePlayer(db,'val-alice')),b=transaction(db,()=>ensurePlayer(db,'val-bob'));return {db,a,b};}
++function good(db){const report=reconcileVal(db);assert.equal(report.ok,true,JSON.stringify(report.errors));assert.deepEqual(new Set(report.accounts.map(a=>a.kind)),new Set(['PLAYER','TREASURY','FAUCET']));}
++function legacy(db){for(const t of db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'val_%'").all())db.exec(`DROP TRIGGER ${t.name}`);for(const table of ['val_openings','val_scope','val_commands','val_play_safety'])db.exec(`DROP TABLE ${table}`);db.prepare('DELETE FROM schema_migrations WHERE version=?').run('val-arcade-1');}
++function snapshot(db){return Object.fromEntries(['accounts','transfers','entries','game_sessions','game_actions','treasury_reserves','browser_sessions','outbox'].map(t=>[t,db.prepare(`SELECT * FROM ${t}`).all()]));}
++
++test('VAL migration preserves IDs, amounts, sessions, opening balances and reserves; second migration is a no-op',()=>{
++ const {db,a}=fixture();try{
++  const s=createGame(db,a,'A1-01',1).session;act(db,a,s.id,{command_id:cmd(),action:'SPIN',expected_version:1,bet:1});
++  transaction(db,()=>reserve(db,'fixture-liability',200));legacy(db);const before=snapshot(db);
++  assert.equal(migrateVal(db).applied,true);assert.deepEqual(snapshot(db),before);assert.equal(migrateVal(db).applied,false);assert.deepEqual(snapshot(db),before);
++  const openings=reconcileVal(db).accounts;assert.equal(openings.find(a=>a.kind==='TREASURY').opening,'800000');assert.equal(openings.find(a=>a.kind==='FAUCET').opening,'2000000');good(db);
++  const old=db.prepare('SELECT command_id FROM game_actions LIMIT 1').get();assert.throws(()=>act(db,a,s.id,{command_id:old.command_id,action:'SPIN',expected_version:1,bet:2}),{code:'LEGACY_COMMAND_UNVERIFIABLE'});
++ }finally{db.close()}
++});
++
++test('VAL migration refuses mismatched legacy genesis instead of inventing a balancing entry',()=>{
++ const {db}=fixture();try{legacy(db);db.exec("UPDATE accounts SET balance=balance+1 WHERE id='wa-faucet'");assert.throws(()=>migrateVal(db),{code:'VAL_RECONCILIATION_REQUIRED'});assert.equal(hasValSchema(db),false)}finally{db.close()}
++});
++
++test('VAL dry-run leaves source unchanged; old writers fail closed after explicit fixture cutover',()=>{
++ const dir=mkdtempSync(path.join(os.tmpdir(),'val-migrate-test-')),file=path.join(dir,'fixture.sqlite');let db;
++ try{({db}=fixture(file));legacy(db);const before=snapshot(db);db.close();db=null;
++  assert.throws(()=>openDb(file),{code:'VAL_MIGRATION_REQUIRED'});
++  const run=flag=>spawnSync(process.execPath,['--experimental-sqlite','scripts/migrate-val.mjs',file,flag],{encoding:'utf8'});
++  const dry=run('--dry-run');assert.equal(dry.status,0,dry.stderr);assert.equal(JSON.parse(dry.stdout).reconciliation.ok,true);
++  db=new DatabaseSync(file);assert.equal(hasValSchema(db),false);assert.deepEqual(snapshot(db),before);db.close();db=null;
++  const apply=run('--apply');assert.equal(apply.status,0,apply.stderr);
++  db=new DatabaseSync(file);assert.throws(()=>db.exec("UPDATE accounts SET balance=balance-1 WHERE id='wa-treasury'"),/val_writer_v1/);db.close();db=openDb(file);assert.deepEqual(snapshot(db),before);good(db);
++ }finally{db?.close();rmSync(dir,{recursive:true,force:true})}
++});
++
++test('VAL transfer retries return the original journal; changed amount/account/reason are rejected',()=>{
++ const {db,a,b}=fixture();try{const input={from:accountId(db,a),to:'wa-treasury',amount:100,eventKey:cmd(),reason:'fixture stake'};
++  assert.throws(()=>postTransfer(db,input),{code:'VAL_TRANSACTION_REQUIRED'});
++  const first=transaction(db,()=>postTransfer(db,input));for(let i=0;i<20;i++)assert.equal(transaction(db,()=>postTransfer(db,input)).transferId,first.transferId);
++  for(const change of [{amount:101},{from:accountId(db,b)},{reason:'changed'}])assert.throws(()=>transaction(db,()=>postTransfer(db,{...input,...change})),{code:'IDEMPOTENCY_CONFLICT'});
++  assert.equal(wallet(db,a),400);assert.equal(readReceipt(db,a,first.transferId).amount,'100');assert.throws(()=>readReceipt(db,b,first.transferId),{code:'RECEIPT_NOT_FOUND'});good(db);
++ }finally{db.close()}
++});
++
++test('VAL integer, overflow, scope and treasury holds reject unsafe spending without partial writes',()=>{
++ const {db,a,b}=fixture();try{const debit={from:accountId(db,a),to:'wa-treasury',amount:1,eventKey:cmd(),reason:'fixture'};
++  for(const amount of [1.5,NaN,Infinity,0,-1,'1',Number.MAX_SAFE_INTEGER+1])assert.throws(()=>transaction(db,()=>postTransfer(db,{...debit,amount})),{code:'INVALID_AMOUNT'});
++  assert.throws(()=>transaction(db,()=>postTransfer(db,{...debit,to:accountId(db,b)})),{code:'POCKET_TRANSFER_FORBIDDEN'});
++  assert.throws(()=>transaction(db,()=>postTransfer(db,{...debit,tenant:'other'})),{code:'INVALID_ACCOUNTS'});
++  transaction(db,()=>reserve(db,'obligation',799999));assert.equal(heldAmount(db,db.prepare("SELECT * FROM accounts WHERE id='wa-treasury'").get()),799999);
++  assert.throws(()=>transaction(db,()=>postTransfer(db,{from:'wa-treasury',to:accountId(db,a),amount:2,eventKey:cmd(),reason:'payout'})),{code:'TREASURY_RESERVED'});
++  assert.equal(readWallet(db,a).held,'0');assert.equal(wallet(db,a),500);good(db);
++  // Deliberately corrupt a fixture only, to exercise the numeric guard and reconciliation.
++  db.prepare("UPDATE accounts SET balance=? WHERE id='wa-treasury'").run(Number.MAX_SAFE_INTEGER);
++  assert.throws(()=>transaction(db,()=>postTransfer(db,debit)),{code:'BALANCE_OVERFLOW'});assert.equal(reconcileVal(db).ok,false);
++  db.prepare('INSERT INTO treasury_reserves VALUES(?,?,?)').run('too-large','wa-world',Number.MAX_SAFE_INTEGER);assert.throws(()=>heldAmount(db,db.prepare("SELECT * FROM accounts WHERE id='wa-treasury'").get()),{code:'RESERVE_OVERFLOW'});
++ }finally{db.close()}
++});
++
++test('VAL simultaneous writers serialize two spends and retry one settlement after commit/reopen',async()=>{
++ const dir=mkdtempSync(path.join(os.tmpdir(),'val-race-test-')),file=path.join(dir,'fixture.sqlite');let db;const workers=[];
++ try{let a;({db,a}=fixture(file));const input={from:accountId(db,a),to:'wa-treasury',amount:400,reason:'race stake'};db.close();db=null;
++  for(let i=0;i<2;i++){const w=new Worker(new URL('./fixtures/val-spend-worker.mjs',import.meta.url),{workerData:{file,transfer:{...input,eventKey:`race-command-${i}`}}});workers.push(w);await eventOnce(w,'message');}
++  const waits=workers.map(w=>eventOnce(w,'message'));workers.forEach(w=>w.postMessage('go'));const results=(await Promise.all(waits)).map(([r])=>r);assert.equal(results.filter(r=>r.ok).length,1);assert.equal(results.find(r=>!r.ok).code,'INSUFFICIENT_ACR');
++  await Promise.all(workers.map(w=>w.terminate()));db=openDb(file);assert.equal(wallet(db,a),100);const winner=results.findIndex(r=>r.ok);assert.equal(transaction(db,()=>postTransfer(db,{...input,eventKey:`race-command-${winner}`})).transferId,results[winner].result.transferId);good(db);
++ }finally{await Promise.all(workers.map(w=>w.terminate()));db?.close();rmSync(dir,{recursive:true,force:true})}
++});
++
++test('VAL game command fingerprint, deterministic payout receipt, and rollback of game/ledger/outbox on failure',()=>{
++ const {db,a}=fixture();try{
++  const s=createGame(db,a,'B1',1).session;
++  // Every number wins one straight bet; rules and RNG remain unchanged.
++  const bets=Array.from({length:37},(_,i)=>({choice:String(i),stake:1}));
++  const c={command_id:cmd(),action:'SPIN',bets,expected_version:1};
++  const result=act(db,a,s.id,c);for(let i=0;i<20;i++)assert.deepEqual(act(db,a,s.id,c),result);
++  const entries=readHistory(db,a,{limit:100}).transactions;assert.ok(entries.some(t=>t.kind==='STAKE'));assert.ok(entries.some(t=>t.kind==='PAYOUT'));
++  assert.throws(()=>act(db,a,s.id,{...c,bets:[{choice:'red',stake:2}]}),{code:'IDEMPOTENCY_CONFLICT'});
++  const s2=createGame(db,a,'A1-01',1).session,before=snapshot(db);
++  db.exec("CREATE TRIGGER fixture_fail BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT,'fixture failure'); END");
++  assert.throws(()=>act(db,a,s2.id,{command_id:cmd(),action:'SPIN',bet:1,expected_version:1}),/fixture failure/);assert.deepEqual(snapshot(db),before);good(db);
++ }finally{db.close()}
++});
++
++test('VAL creation retry prevents a second blackjack initial debit',()=>{
++ const {db,a}=fixture();try{const key=cmd(),first=createGame(db,a,'B2',10,key);assert.deepEqual(createGame(db,a,'B2',10,key),first);assert.equal(db.prepare('SELECT COUNT(*) n FROM game_sessions').get().n,1);assert.throws(()=>createGame(db,a,'B2',20,key),{code:'COMMAND_PAYLOAD_MISMATCH'});good(db)}finally{db.close()}
++});
++
++test('VAL pagination has stable tie ordering, no duplicates, and enforces receipt/cursor ownership',()=>{
++ const {db,a,b}=fixture();try{for(let i=0;i<8;i++)transaction(db,()=>postTransfer(db,{from:accountId(db,a),to:'wa-treasury',amount:1,eventKey:cmd(),reason:'fixture'}));db.exec('UPDATE transfers SET created_ms=100');
++  const ids=[];let cursor=null;do{const page=readHistory(db,a,{cursor,limit:2});ids.push(...page.transactions.map(t=>t.id));cursor=page.next_cursor}while(cursor);
++  assert.equal(ids.length,9);assert.equal(new Set(ids).size,9);assert.deepEqual(ids,[...ids].sort().reverse());
++  assert.throws(()=>readHistory(db,b,{cursor:ids[0]}),{code:'RECEIPT_NOT_FOUND'});assert.throws(()=>readHistory(db,a,{limit:0}),{code:'INVALID_PAGE_SIZE'});good(db);
++ }finally{db.close()}
++});
++
++test('VAL safety consumes gross stake, rejects resets/new bets, but preserves committed replay and payout',()=>{
++ const {db,a}=fixture();try{transaction(db,()=>updateSafety(db,a,{action:'START_SESSION',budget:10}));const s=createGame(db,a,'A1-01',10).session,c={command_id:cmd(),expected_version:1,action:'SPIN',bet:10},first=act(db,a,s.id,c);
++  assert.equal(playSafety(db,a).spent,'10');assert.throws(()=>transaction(db,()=>updateSafety(db,a,{action:'START_SESSION',budget:100})),{code:'PLAY_BREAK_REQUIRED'});
++  assert.throws(()=>transaction(db,()=>postTransfer(db,{from:accountId(db,a),to:'wa-treasury',amount:1,eventKey:cmd(),reason:'stake'})),{code:'PLAY_BUDGET_REACHED'});
++  transaction(db,()=>updateSafety(db,a,{action:'EXCLUDE',days:1}));assert.deepEqual(act(db,a,s.id,c),first);
++  assert.throws(()=>createGame(db,a,'B2',1),{code:'SELF_EXCLUDED'});
++  transaction(db,()=>postTransfer(db,{from:'wa-treasury',to:accountId(db,a),amount:1,eventKey:cmd(),reason:'committed refund'}));good(db);
++ }finally{db.close()}
++});
++
++test('VAL multiplayer enforces exclusion on every participant atomically; settled room replays only once',()=>{
++ const {db,a,b}=fixture();try{const create={bet:10,command_id:cmd()},r=createRoom(db,a,create).room;assert.throws(()=>createRoom(db,a,{...create,bet:20}),{code:'IDEMPOTENCY_CONFLICT'});
++  joinRoom(db,b,r.code,{expected_version:1,command_id:cmd()});roomAction(db,a,r.id,{action:'READY',expected_version:2,command_id:cmd()});roomAction(db,b,r.id,{action:'READY',expected_version:3,command_id:cmd()});
++  transaction(db,()=>updateSafety(db,b,{action:'EXCLUDE',days:1}));const before=snapshot(db);assert.throws(()=>roomAction(db,a,r.id,{action:'START',expected_version:4,command_id:cmd()}),{code:'SELF_EXCLUDED'});assert.deepEqual(snapshot(db),before);
++  // Advance fixture time, never expose an unblock API.
++  db.exec('UPDATE val_play_safety SET excluded_until=0');const c={action:'START',expected_version:4,command_id:cmd()},out=roomAction(db,a,r.id,c);assert.deepEqual(roomAction(db,a,r.id,c),out);assert.throws(()=>roomAction(db,a,r.id,{...c,action:'CANCEL'}),{code:'IDEMPOTENCY_CONFLICT'});good(db);
++ }finally{db.close()}
++});
++
++test('VAL multiplayer blackjack keeps existing payout obligations after exclusion',()=>{
++ const {db,a}=fixture();try{let t=createBlackjackTable(db,a,{bet:1,command_id:cmd()}).table;const action=name=>{t=blackjackTableAction(db,a,t.id,{action:name,expected_version:t.version,command_id:cmd()}).table};action('READY');action('START');transaction(db,()=>updateSafety(db,a,{action:'EXCLUDE',days:1}));while(t.status==='PLAYING')action('STAND');assert.equal(t.status,'FINISHED');assert.equal(db.prepare('SELECT COUNT(*) n FROM treasury_reserves').get().n,0);good(db)}finally{db.close()}
++});
++
++test('VAL bonus choice preserves sealed payout, reserve and exactly-once ledger',()=>{
++ const {db,a}=fixture();try{const s=createGame(db,a,'A1-05',1).session;const grid=Array.from({length:4},()=>['K','Q','J','K','Q','J']);for(let i=0;i<6;i++)grid[0][i]=POT;const state=resolveFusionSpin(initialFusionState(1),grid,1);db.prepare('UPDATE game_sessions SET state_json=? WHERE id=?').run(JSON.stringify(state),s.id);
++  const c={command_id:cmd(),expected_version:1,action:'OPEN_POT',choice:2},out=act(db,a,s.id,c);assert.deepEqual(act(db,a,s.id,c),out);assert.equal(wallet(db,a),500+out.session.last_open.payout);good(db);
++ }finally{db.close()}
++});
++
++test('VAL scheduled roulette refund and lottery payout retain reserve and settle while excluded',()=>{
++ const {db,a}=fixture();const old=process.env.LOTTERY_ENABLED;process.env.LOTTERY_ENABLED='true';try{
++  const roulette=createRoulette(db,admin,{closes_ms:Date.now()+60000,budget:10000,command_id:cmd()});submitSlip(db,a,roulette.id,{bets:[{choice:'red',stake:10}],command_id:cmd()});
++  let l=createLottery(db,admin,{title:'VAL fixture',digits:4,price:10,base_prize:100,max_prize:100,budget:1000,capacity:10,per_player:2,opens_ms:Date.now()-1000,closes_ms:Date.now()+60000,publishes_ms:Date.now()+90000,early_release:true,command_id:cmd()});l=lotteryAdminAction(db,admin,l.id,{action:'OPEN',expected_version:l.version,command_id:cmd()});const seed=db.prepare('SELECT seed FROM draw_commits WHERE round_id=?').get(l.id).seed;buyLotteryTicket(db,a,l.id,{guess:lotteryNumber(seed,l.id,4),command_id:cmd()});
++  transaction(db,()=>updateSafety(db,a,{action:'EXCLUDE',days:1}));rouletteAdminAction(db,admin,roulette.id,{action:'CANCEL',expected_version:rouletteView(db,roulette.id).version,command_id:cmd()});
++  db.prepare('UPDATE lottery_campaigns SET closes_ms=0,publishes_ms=0 WHERE id=?').run(l.id);sweepLottery(db);const before=snapshot(db);sweepLottery(db);assert.deepEqual(snapshot(db),before);assert.equal(lotteryView(db,l.id).status,'SETTLED');const kinds=readHistory(db,a,{limit:100}).transactions.map(t=>t.kind);assert.ok(kinds.includes('REFUND'));assert.ok(kinds.includes('PAYOUT'));assert.equal(db.prepare('SELECT COUNT(*) n FROM treasury_reserves').get().n,0);good(db);
++ }finally{if(old===undefined)delete process.env.LOTTERY_ENABLED;else process.env.LOTTERY_ENABLED=old;db.close()}
++});
+--- /dev/null
++++ b/tests/fixtures/val-spend-worker.mjs
+@@ -0,0 +1,8 @@
++import {parentPort,workerData} from 'node:worker_threads';
++import {DatabaseSync} from 'node:sqlite';
++import {transaction} from '../../src/db.mjs';
++import {registerValWriter} from '../../src/val/schema.mjs';
++import {postTransfer} from '../../src/val/ledger.mjs';
++const db=new DatabaseSync(workerData.file);registerValWriter(db);db.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON');
++parentPort.postMessage('ready');
++parentPort.once('message',()=>{try{parentPort.postMessage({ok:true,result:transaction(db,()=>postTransfer(db,workerData.transfer))})}catch(e){parentPort.postMessage({ok:false,code:e.code})}finally{db.close()}});
+--- /dev/null
++++ b/web/src/components/ValWallet.jsx
+@@ -0,0 +1,34 @@
++import React,{useEffect,useRef,useState} from 'react';
++import {api,money,clock} from '../api';
++import './val-wallet.css';
++const labels={INITIAL_CREDIT:'Kredit awal',STAKE:'Taruhan',PAYOUT:'Hasil permainan (payout)',REFUND:'Pengembalian',CORRECTION:'Koreksi admin'};
++export default function ValWallet({onBalance}){
++ const [wallet,setWallet]=useState(null),[items,setItems]=useState([]),[cursor,setCursor]=useState(null),[receipt,setReceipt]=useState(null),[selected,setSelected]=useState(null);
++ const [busy,setBusy]=useState(false),[error,setError]=useState(''),[detailError,setDetailError]=useState(''),[safety,setSafety]=useState(null),[confirm,setConfirm]=useState(false);
++ const generation=useRef(0),detailRequest=useRef(0),lock=useRef(false);
++ async function load(more=false){
++  if(lock.current)return;lock.current=true;setBusy(true);setError('');const current=generation.current;
++  try{
++   const [w,h,s]=await Promise.all([api('GET','/api/val/v1/wallets'),api('GET','/api/val/v1/transactions'+(more?`?cursor=${cursor}`:'')),api('GET','/api/val/v1/play-safety')]);
++   if(current!==generation.current)return;
++   setWallet(w.wallets[0]);onBalance(Number(w.wallets[0].available));setItems(old=>more?[...old,...h.transactions.filter(t=>!old.some(x=>x.id===t.id))]:h.transactions);setCursor(h.next_cursor);setSafety(s);
++  }catch(e){if(current===generation.current)setError(e.message)}finally{lock.current=false;if(current===generation.current)setBusy(false)}
++ }
++ useEffect(()=>{load();return()=>{generation.current++;detailRequest.current++;lock.current=false}},[]);
++ async function detail(id){const request=++detailRequest.current;setSelected(id);setReceipt(null);setDetailError('');try{const r=await api('GET',`/api/val/v1/transactions/${id}`);if(request===detailRequest.current)setReceipt(r.receipt)}catch(e){if(request===detailRequest.current)setDetailError(e.message)}}
++ async function changeSafety(body){if(lock.current)return;lock.current=true;setBusy(true);setError('');try{setSafety(await api('POST','/api/val/v1/play-safety',body));setConfirm(false)}catch(e){setError(e.message)}finally{lock.current=false;setBusy(false)}}
++ return <section className="val-wallet" aria-label="EV-wallet VAL">
++  <div className="view-intro"><span className="eyebrow">VIRTUAL AL · WORLD ARCADE</span><h1>EV-wallet VAL</h1><p>VAL Arcade — sebelumnya ACR. Kredit virtual bulat, tanpa kurs uang nyata.</p></div>
++  <div className="val-balance"><div className="val-mark" aria-hidden="true">V<span>AL</span></div><span>SALDO TERSEDIA</span><strong data-testid="val-available">{wallet?money(wallet.available):'—'} <small>VAL</small></strong><dl><div><dt>Tercatat</dt><dd>{wallet?money(wallet.posted):'—'} VAL</dd></div><div><dt>Ditahan</dt><dd>{wallet?money(wallet.held):'—'} VAL</dd></div></dl><p>Saldo berasal dari server. Taruhan yang sudah dibayar tercatat sebagai debit; cadangan hadiah disimpan pada treasury.</p></div>
++  <p className="val-note">1 ACR lama = 1 VAL Arcade. Tanpa pembelian, penarikan uang, atau transfer antarpocket.</p>
++  <div className="panel"><div className="panel-head"><h2>Riwayat transaksi</h2><button className="btn outline" disabled={busy} onClick={()=>load()}>Segarkan dompet</button></div>
++   {error&&<div role="alert"><p>{error} Data yang tampil mungkin belum terbaru.</p><button className="btn outline" disabled={busy} onClick={()=>load()}>Coba lagi</button></div>}
++   {busy&&<p role="status">Memuat data server…</p>}
++   {!busy&&!error&&items.length===0&&<p>Belum ada transaksi.</p>}
++   <div className="val-history">{items.map(t=><button className="val-row" key={t.id} onClick={()=>detail(t.id)}><span><strong>{labels[t.kind]}</strong><small>{clock(t.created_ms)} · Tercatat</small><small>Ref: {t.reference}</small></span><b className={t.delta.startsWith('-')?'negative':'positive'}>{t.delta.startsWith('-')?'−':'+'}{money(t.amount)} VAL</b></button>)}</div>
++   {cursor&&<button className="btn outline" disabled={busy} onClick={()=>load(true)}>Muat transaksi sebelumnya</button>}
++  </div>
++  {selected&&<section className="panel val-receipt" aria-label="Detail receipt"><div className="panel-head"><h2>Receipt transaksi</h2><button className="btn ghost" onClick={()=>{detailRequest.current++;setSelected(null)}}>Tutup receipt</button></div>{detailError?<div role="alert"><p>{detailError}</p><button className="btn outline" onClick={()=>detail(selected)}>Coba receipt lagi</button></div>:!receipt?<p role="status">Memuat receipt…</p>:<><dl>{[['Jenis',labels[receipt.kind]],['Jumlah',`${receipt.delta.startsWith('-')?'−':'+'}${money(receipt.amount)} VAL`],['Status','Tercatat (POSTED)'],['Waktu',clock(receipt.created_ms)],['ID transaksi',receipt.id],['Referensi',receipt.reference],['Pocket','VAL Arcade']].map(([label,value])=><div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl><p>Payout adalah jumlah kredit hasil permainan, termasuk pengembalian taruhan bila aturan game demikian. Payout bukan hasil bersih; hasil bersih = payout dikurangi taruhan terkait.</p></>}</section>}
++  <section className="panel"><h2>Kendali bermain</h2><p>Aktifkan batas sesi 15 menit dengan anggaran total 100 VAL dan jeda 15 menit. Kemenangan tidak mengisi kembali anggaran.</p>{safety?.excluded_until>Date.now()?<p role="status">Taruhan baru diblokir hingga {clock(safety.excluded_until)}. Hak payout dan refund tetap diproses.</p>:<><button className="btn outline" disabled={busy} onClick={()=>changeSafety({action:'START_SESSION',budget:100})}>Mulai sesi terbatas</button><button className="btn outline" disabled={busy} onClick={()=>setConfirm(true)}>Blokir bermain 24 jam</button></>}{safety?.limits_active&&<p>Stake terpakai {money(safety.spent)} / {money(safety.budget)} VAL · sesi berakhir {clock(safety.session_end)}</p>}{confirm&&<div><p>Blokir langsung berlaku di Web dan konektor WA Arcade selama 24 jam dan tidak bisa dibatalkan dari layar ini.</p><button className="btn primary" disabled={busy} onClick={()=>changeSafety({action:'EXCLUDE',days:1})}>Konfirmasi blokir 24 jam</button><button className="btn ghost" onClick={()=>setConfirm(false)}>Batal</button></div>}<p className="val-note">Prototipe lokal. Batas harian dan penyelesaian bonus saat blokir belum lengkap; belum siap beta publik.</p></section>
++ </section>;
++}
+--- /dev/null
++++ b/web/src/components/val-wallet.css
+@@ -0,0 +1 @@
++.val-wallet{max-width:1000px;margin:auto}.val-wallet .panel{margin-top:24px}.val-wallet h2{font-size:1.15rem}.val-balance{position:relative;overflow:hidden;padding:32px;border:1px solid #4cccb044;border-radius:24px;background:linear-gradient(120deg,#123f42,#102932 70%);color:#dcfff1}.val-balance>span{font-size:.75rem;letter-spacing:.16em}.val-balance>strong{display:block;font-size:clamp(2rem,6vw,3.4rem);margin:12px 0 24px}.val-balance small{font-size:1rem}.val-balance dl{display:flex;gap:40px}.val-balance dt{color:#9dbfb6}.val-balance dd{margin:6px 0}.val-balance p{max-width:550px;font-size:.85rem;line-height:1.6;color:#a4c8bd}.val-mark{position:absolute;right:32px;top:20px;font-size:4rem;font-weight:800;color:#64ddba44}.val-mark span{font-size:1.5rem}.val-note{color:var(--muted,#a9b3c4);font-size:.85rem;line-height:1.6}.val-row{width:100%;display:flex;align-items:center;justify-content:space-between;gap:16px;text-align:left;border:0;border-bottom:1px solid #ffffff14;background:transparent;color:inherit;padding:18px 0;cursor:pointer}.val-row:hover,.val-row:focus-visible{background:#70ddbc0c}.val-row span{min-width:0}.val-row small{display:block;color:var(--muted,#a9b3c4);margin-top:6px;overflow-wrap:anywhere}.val-row b{white-space:nowrap}.val-receipt dl>div{display:grid;grid-template-columns:130px 1fr;gap:16px;padding:10px 0;border-bottom:1px solid #ffffff14}.val-receipt dd{margin:0;overflow-wrap:anywhere}.val-receipt p{line-height:1.6;color:var(--muted,#a9b3c4)}.val-wallet .btn{margin:4px}.val-wallet [role=alert]{border-left:3px solid #f0a889;padding:12px}@media(max-width:540px){.val-balance{padding:24px}.val-mark{right:16px;font-size:3rem}.val-row{align-items:flex-start;gap:10px}.val-row b{font-size:.85rem}.val-receipt dl>div{grid-template-columns:1fr;gap:4px}.val-wallet .panel-head{flex-wrap:wrap}}
+--- /dev/null
++++ b/src/val/api.mjs
+@@ -0,0 +1,16 @@
++import {readWallet,readHistory,readReceipt} from './ledger.mjs';
++import {playSafety,updateSafety} from './play-safety.mjs';
++import {transaction} from '../db.mjs';
++import {assert} from '../util.mjs';
++export function valApi(db,session,method,path,query,body){
++ const {player_id:player,tenant_id:tenant}=session;
++ assert(tenant==='wa-world',403,'TENANT_NOT_SUPPORTED');
++ // Scope and owner come only from the authenticated browser session.
++ if(method==='GET'&&path==='/wallets')return {wallets:[readWallet(db,player,tenant)]};
++ if(method==='GET'&&path==='/transactions')return readHistory(db,player,{cursor:query.get('cursor'),limit:query.has('limit')?Number(query.get('limit')):20},tenant);
++ const match=path.match(/^\/transactions\/([a-f0-9]{32})$/);
++ if(method==='GET'&&match)return {receipt:readReceipt(db,player,match[1],tenant)};
++ if(path==='/play-safety'&&method==='GET')return playSafety(db,player,tenant);
++ if(path==='/play-safety'&&method==='POST')return transaction(db,()=>updateSafety(db,player,body,tenant));
++ assert(false,404,'ENDPOINT_NOT_FOUND');
++}
+--- /dev/null
++++ b/src/val/commands.mjs
+@@ -0,0 +1,24 @@
++import {assert,digest} from '../util.mjs';
++export function canonical(value){
++ if(Array.isArray(value))return value.map(canonical);
++ if(value&&typeof value==='object')return Object.fromEntries(Object.keys(value).sort().filter(k=>value[k]!==undefined).map(k=>[k,canonical(value[k])]));
++ return value;
++}
++// Call inside the SAME transaction, before legacy replay lookup. A thrown command rolls this back too.
++export function bindCommand(db,actor,key,payload,tenant='wa-world'){
++ assert(db.isTransaction,500,'VAL_TRANSACTION_REQUIRED');
++ // expected_version is a precondition for a NEW command; WA refreshes it on redelivery.
++ const {expected_version,...businessPayload}=payload;
++ const fingerprint=digest(JSON.stringify(canonical(businessPayload)));
++ const old=db.prepare('SELECT fingerprint FROM val_commands WHERE tenant_id=? AND actor=? AND command_id=?').get(tenant,actor,key);
++ if(old)assert(old.fingerprint===fingerprint,409,'IDEMPOTENCY_CONFLICT');
++ else {
++  // Pre-VAL response caches did not retain the request. Never guess its fingerprint.
++  for(const [table,owner] of [['game_actions',null],['multiplayer_commands','player_id'],['bj_commands','player_id']]){
++   if(!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table))continue;
++   const prior=db.prepare(`SELECT 1 FROM ${table} WHERE tenant_id=? AND command_id=?${owner?` AND ${owner}=?`:''}`).get(...(owner?[tenant,key,actor]:[tenant,key]));
++   assert(!prior,409,'LEGACY_COMMAND_UNVERIFIABLE');
++  }
++  db.prepare('INSERT INTO val_commands VALUES(?,?,?,?)').run(tenant,actor,key,fingerprint);
++ }
++}
+--- /dev/null
++++ b/src/val/ledger.mjs
+@@ -0,0 +1,54 @@
++import {assert,uuid,now} from '../util.mjs';
++import {enforceStake} from './play-safety.mjs';
++
++export const VAL_SCOPE=Object.freeze({currency:'VAL',pocket:'arcade',app_id:'world-arcade'});
++export function heldAmount(db,account){
++ const amount=account.kind==='TREASURY'?db.prepare('SELECT amount FROM treasury_reserves WHERE tenant_id=?').all(account.tenant_id).reduce((sum,row)=>sum+BigInt(row.amount),0n):0n;
++ assert(amount>=0n&&amount<=BigInt(Number.MAX_SAFE_INTEGER),409,'RESERVE_OVERFLOW');return Number(amount);
++}
++// Internal only: the authenticated game/administrator decides accounts and amount.
++export function postTransfer(db,{tenant='wa-world',from,to,amount,eventKey,reason,kind}){
++ assert(db.isTransaction,500,'VAL_TRANSACTION_REQUIRED');
++ assert(Number.isSafeInteger(amount)&&amount>0&&amount<=1000000000000,400,'INVALID_AMOUNT');
++ assert(typeof eventKey==='string'&&eventKey.length>0&&typeof reason==='string',400,'INVALID_TRANSFER');
++ const old=db.prepare('SELECT * FROM transfers WHERE tenant_id=? AND event_key=?').get(tenant,eventKey);
++ if(old){
++  const entries=db.prepare('SELECT account_id,delta FROM entries WHERE transfer_id=?').all(old.id);
++  assert(old.reason===reason&&entries.length===2&&entries.some(e=>e.account_id===from&&e.delta===-amount)&&entries.some(e=>e.account_id===to&&e.delta===amount),409,'IDEMPOTENCY_CONFLICT');
++  return {reused:true,transferId:old.id};
++ }
++ const src=db.prepare('SELECT * FROM accounts WHERE id=? AND tenant_id=?').get(from,tenant),dst=db.prepare('SELECT * FROM accounts WHERE id=? AND tenant_id=?').get(to,tenant);
++ assert(src&&dst,400,'INVALID_ACCOUNTS');assert(from!==to,400,'SAME_ACCOUNT');
++ assert(!(src.kind==='PLAYER'&&dst.kind==='PLAYER'),403,'POCKET_TRANSFER_FORBIDDEN');
++ assert(Number.isSafeInteger(src.balance)&&Number.isSafeInteger(dst.balance)&&Number.isSafeInteger(dst.balance+amount),400,'BALANCE_OVERFLOW');
++ assert(src.balance>=amount,409,'INSUFFICIENT_ACR');
++ assert(src.balance-amount>=heldAmount(db,src),409,'TREASURY_RESERVED');
++ if(src.kind==='PLAYER'&&kind!=='CORRECTION')enforceStake(db,src.owner_id,amount,tenant);
++ const id=uuid();db.prepare('INSERT INTO transfers VALUES(?,?,?,?,?)').run(id,tenant,eventKey,reason,now());
++ db.prepare('UPDATE accounts SET balance=balance-? WHERE id=?').run(amount,from);
++ db.prepare('UPDATE accounts SET balance=balance+? WHERE id=?').run(amount,to);
++ db.prepare('INSERT INTO entries(transfer_id,account_id,delta) VALUES(?,?,?)').run(id,from,-amount);
++ db.prepare('INSERT INTO entries(transfer_id,account_id,delta) VALUES(?,?,?)').run(id,to,amount);
++ return {reused:false,transferId:id};
++}
++
++function ownedAccount(db,player,tenant){const a=db.prepare("SELECT * FROM accounts WHERE tenant_id=? AND owner_id=? AND kind='PLAYER'").get(tenant,player);assert(a,404,'WALLET_NOT_FOUND');return a;}
++export function readWallet(db,player,tenant='wa-world'){
++ const a=ownedAccount(db,player,tenant),held=heldAmount(db,a);assert(Number.isSafeInteger(a.balance)&&a.balance>=held,409,'WALLET_RECONCILIATION_REQUIRED');
++ return {...VAL_SCOPE,posted:String(a.balance),held:String(held),available:String(a.balance-held),legacy_currency:'ACR'};
++}
++function projection(row){
++ const kind=row.event_key.startsWith('starter:')?'INITIAL_CREDIT':/refund/i.test(row.event_key+row.reason)?'REFUND':/admin/i.test(row.event_key+row.reason)?'CORRECTION':row.delta<0?'STAKE':'PAYOUT';
++ return {...VAL_SCOPE,id:row.id,reference:row.event_key,kind,amount:String(Math.abs(row.delta)),delta:String(row.delta),status:'POSTED',created_ms:row.created_ms};
++}
++const receiptQuery=`SELECT t.*,e.delta FROM transfers t JOIN entries e ON e.transfer_id=t.id WHERE t.tenant_id=? AND e.account_id=?`;
++export function readReceipt(db,player,id,tenant='wa-world'){
++ const a=ownedAccount(db,player,tenant),row=db.prepare(receiptQuery+' AND t.id=?').get(tenant,a.id,id);assert(row,404,'RECEIPT_NOT_FOUND');return projection(row);
++}
++export function readHistory(db,player,{cursor=null,limit=20}={},tenant='wa-world'){
++ const a=ownedAccount(db,player,tenant);assert(Number.isInteger(limit)&&limit>=1&&limit<=100,400,'INVALID_PAGE_SIZE');
++ let before=null;
++ if(cursor){assert(/^[a-f0-9]{32}$/.test(cursor),400,'INVALID_CURSOR');before=readReceipt(db,player,cursor,tenant);}
++ const rows=before?db.prepare(receiptQuery+' AND (t.created_ms<? OR (t.created_ms=? AND t.id<?)) ORDER BY t.created_ms DESC,t.id DESC LIMIT ?').all(tenant,a.id,before.created_ms,before.created_ms,before.id,limit+1):db.prepare(receiptQuery+' ORDER BY t.created_ms DESC,t.id DESC LIMIT ?').all(tenant,a.id,limit+1);
++ const page=rows.slice(0,limit);return {transactions:page.map(projection),next_cursor:rows.length>limit?page.at(-1).id:null};
++}
+--- /dev/null
++++ b/src/val/play-safety.mjs
+@@ -0,0 +1,28 @@
++import {assert,now} from '../util.mjs';
++export function playSafety(db,player,tenant='wa-world'){
++ const row=db.prepare('SELECT * FROM val_play_safety WHERE tenant_id=? AND player_id=?').get(tenant,player);
++ return {excluded_until:row?.excluded_until??0,session_end:row?.session_end??0,pause_until:row?.pause_until??0,budget:String(row?.budget??0),spent:String(row?.spent??0),limits_active:Boolean(row?.session_end),public_beta_ready:false};
++}
++export function updateSafety(db,player,input,tenant='wa-world'){
++ assert(db.isTransaction,500,'VAL_TRANSACTION_REQUIRED');
++ db.prepare('INSERT OR IGNORE INTO val_play_safety(tenant_id,player_id) VALUES(?,?)').run(tenant,player);
++ const row=db.prepare('SELECT * FROM val_play_safety WHERE tenant_id=? AND player_id=?').get(tenant,player),time=now();
++ if(input.action==='EXCLUDE'){
++  assert([1,7,30].includes(input.days),400,'INVALID_EXCLUSION');
++  db.prepare('UPDATE val_play_safety SET excluded_until=? WHERE tenant_id=? AND player_id=?').run(Math.max(row.excluded_until,time+input.days*86400000),tenant,player);
++ }else if(input.action==='START_SESSION'){
++  assert(row.excluded_until<=time,403,'SELF_EXCLUDED');assert(row.pause_until<=time,409,'PLAY_BREAK_REQUIRED');
++  assert(Number.isSafeInteger(input.budget)&&input.budget>=1&&input.budget<=100,400,'INVALID_PLAY_BUDGET');
++  db.prepare('UPDATE val_play_safety SET session_end=?,pause_until=?,budget=?,spent=0 WHERE tenant_id=? AND player_id=?').run(time+15*60000,time+30*60000,input.budget,tenant,player);
++ }else assert(false,400,'INVALID_SAFETY_ACTION');
++ return playSafety(db,player,tenant);
++}
++export function enforceStake(db,player,amount,tenant){
++ const row=db.prepare('SELECT * FROM val_play_safety WHERE tenant_id=? AND player_id=?').get(tenant,player);if(!row)return;
++ assert(row.excluded_until<=now(),403,'SELF_EXCLUDED');
++ if(row.session_end){
++  assert(now()<row.session_end,403,'PLAY_SESSION_ENDED');
++  assert(Number.isSafeInteger(row.spent+amount)&&row.spent+amount<=row.budget,403,'PLAY_BUDGET_REACHED');
++  db.prepare('UPDATE val_play_safety SET spent=spent+? WHERE tenant_id=? AND player_id=?').run(amount,tenant,player);
++ }
++}
+--- /dev/null
++++ b/src/val/schema.mjs
+@@ -0,0 +1,53 @@
++import {assert,now} from '../util.mjs';
++
++export const VAL_VERSION='val-arcade-1';
++export function registerValWriter(db){db.function('val_writer_v1',()=>1);}
++export function hasValSchema(db){return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='val_openings'").get());}
++
++// No inferred balancing entries: the supported RC3 genesis is explicit and audited.
++export function reconcileVal(db,{legacy=false}={}){
++ const errors=[];
++ const accounts=db.prepare('SELECT * FROM accounts').all();
++ const totals=new Map(accounts.map(a=>[a.id,0n]));
++ const journals=new Map();
++ for(const e of db.prepare('SELECT e.*,t.tenant_id FROM entries e JOIN transfers t ON t.id=e.transfer_id').all()){
++  const a=accounts.find(a=>a.id===e.account_id);
++  if(!Number.isSafeInteger(e.delta)||!a||a.tenant_id!==e.tenant_id){errors.push({code:'INVALID_ENTRY',id:e.id});continue;}
++  totals.set(a.id,totals.get(a.id)+BigInt(e.delta));
++  const j=journals.get(e.transfer_id)??{sum:0n,count:0};j.sum+=BigInt(e.delta);j.count++;journals.set(e.transfer_id,j);
++ }
++ for(const t of db.prepare('SELECT id FROM transfers').all()){
++  const j=journals.get(t.id);if(!j||j.sum!==0n||j.count!==2)errors.push({code:'UNBALANCED_JOURNAL',id:t.id});
++ }
++ const report=accounts.map(a=>{
++  const opening=legacy?(a.id==='wa-faucet'?2000000:a.id==='wa-treasury'?800000:0):db.prepare('SELECT amount FROM val_openings WHERE account_id=?').get(a.id)?.amount;
++  if(!Number.isSafeInteger(a.balance)||!Number.isSafeInteger(opening)||BigInt(a.balance)!==BigInt(opening??0)+totals.get(a.id))errors.push({code:'BALANCE_MISMATCH',id:a.id});
++  const held=a.kind==='TREASURY'?db.prepare('SELECT amount FROM treasury_reserves WHERE tenant_id=?').all(a.tenant_id).reduce((n,r)=>n+BigInt(r.amount),0n):0n;
++  if(held>BigInt(a.balance)||held>BigInt(Number.MAX_SAFE_INTEGER))errors.push({code:'RESERVE_DEFICIT',id:a.id});
++  return {id:a.id,kind:a.kind,opening:String(opening??0),posted:String(a.balance),entries:String(totals.get(a.id)),held:String(held)};
++ });
++ return {ok:errors.length===0,currency:'VAL',pocket:'arcade',accounts:report,journals:journals.size,errors};
++}
++
++export function migrateVal(db){
++ registerValWriter(db);
++ if(hasValSchema(db))return {applied:false,reconciliation:reconcileVal(db)};
++ db.exec('BEGIN IMMEDIATE');
++ try{
++  const before=reconcileVal(db,{legacy:true});assert(before.ok,409,'VAL_RECONCILIATION_REQUIRED');
++  db.exec(`
++   CREATE TABLE val_openings(account_id TEXT PRIMARY KEY REFERENCES accounts(id),amount INTEGER NOT NULL CHECK(amount>=0),basis TEXT NOT NULL);
++   CREATE TABLE val_scope(id INTEGER PRIMARY KEY CHECK(id=1),currency TEXT NOT NULL CHECK(currency='VAL'),pocket TEXT NOT NULL CHECK(pocket='arcade'),app_id TEXT NOT NULL CHECK(app_id='world-arcade'));
++   INSERT INTO val_scope VALUES(1,'VAL','arcade','world-arcade');
++   CREATE TABLE val_commands(tenant_id TEXT NOT NULL,actor TEXT NOT NULL,command_id TEXT NOT NULL,fingerprint TEXT NOT NULL,PRIMARY KEY(tenant_id,actor,command_id));
++   CREATE TABLE val_play_safety(tenant_id TEXT NOT NULL,player_id TEXT NOT NULL REFERENCES players(id),excluded_until INTEGER NOT NULL DEFAULT 0,session_end INTEGER NOT NULL DEFAULT 0,pause_until INTEGER NOT NULL DEFAULT 0,budget INTEGER NOT NULL DEFAULT 0,spent INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(tenant_id,player_id));
++   CREATE INDEX IF NOT EXISTS val_entries_account ON entries(account_id,transfer_id);
++  `);
++  for(const a of before.accounts)db.prepare('INSERT INTO val_openings VALUES(?,?,?)').run(a.id,Number(a.opening),'RC3 genesis: faucet 2000000; treasury 800000; player 0');
++  db.exec(`CREATE TRIGGER val_new_account AFTER INSERT ON accounts BEGIN INSERT INTO val_openings VALUES(NEW.id,NEW.balance,'account creation'); END;`);
++  // Older binaries cannot resolve this connection-local function and fail closed.
++  for(const table of ['accounts','transfers','entries','treasury_reserves'])for(const operation of ['INSERT','UPDATE','DELETE'])db.exec(`CREATE TRIGGER val_fence_${table}_${operation} BEFORE ${operation} ON ${table} BEGIN SELECT CASE WHEN val_writer_v1()<>1 THEN RAISE(ABORT,'VAL_WRITER_REQUIRED') END; END;`);
++  db.prepare('INSERT OR IGNORE INTO schema_migrations VALUES(?,?)').run(VAL_VERSION,now());
++  db.exec('COMMIT');return {applied:true,reconciliation:reconcileVal(db)};
++ }catch(e){db.exec('ROLLBACK');throw e;}
++}
